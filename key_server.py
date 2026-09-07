@@ -54,17 +54,10 @@ app = FastAPI(title="매물 검증 데스크 - 원격 키 서버")
 
 # launcher.py의 SETTING_KEYS와 정확히 같은 이름을 써야 한다 - 이름이 다르면
 # launcher.py가 응답을 받고도 값을 못 채워넣는다.
-#
-# ★ KAKAO_JS_KEY: 카카오맵 "지도 표시"(JavaScript SDK)용 키로, 주소→좌표 변환에
-# 쓰는 REST API 키(KAKAO_KEY)와는 카카오 개발자센터에서 별도로 발급받는 다른
-# 키다. 이 목록에 빠져 있으면 로컬에 배포된 main.py가 KAKAO_JS_KEY를 못 받아서
-# KAKAO_KEY(REST 키)로 폴백하게 되고, 그 REST 키로 지도 SDK를 불러오면 카카오가
-# "appKeyType is REST_API_KEY. but expected JAVASCRIPT_KEY" 401 에러로 거부한다
-# (지도만 안 뜨고 건축물/토지 정보 같은 REST 기반 기능은 멀쩡한 이유가 이것).
 KEY_NAMES = [
     "ANTHROPIC_API_KEY",
     "KAKAO_KEY",
-    "KAKAO_JS_KEY",
+    "KAKAO_JS_KEY",   # 지도 "표시"용 - KAKAO_KEY(REST, 주소변환용)와는 다른 별도 키
     "DATA_SERVICE_KEY",
     "VWORLD_KEY",
     "VWORLD_DOMAIN",
