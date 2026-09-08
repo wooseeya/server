@@ -107,6 +107,13 @@ def _fetch_agent_tokens_from_github() -> dict:
     repo = os.environ.get("AGENTS_GITHUB_REPO", "").strip()          # 예: "myuser/listing-verify-agents"
     token = os.environ.get("AGENTS_GITHUB_TOKEN", "").strip()
     if not repo or not token:
+        missing = []
+        if not repo:
+            missing.append("AGENTS_GITHUB_REPO")
+        if not token:
+            missing.append("AGENTS_GITHUB_TOKEN")
+        print(f"[AGENT_TOKENS/GitHub] 아직 설정 안 됨 - 다음 환경변수가 비어 있어 GitHub 조회를 "
+              f"건너뜁니다: {', '.join(missing)}", flush=True)
         return {}
     path = os.environ.get("AGENTS_GITHUB_PATH", "agents.json").strip() or "agents.json"
     branch = os.environ.get("AGENTS_GITHUB_BRANCH", "main").strip() or "main"
