@@ -141,16 +141,25 @@ def _load_agent_tokens() -> dict:
             data = json.loads(raw)
             if isinstance(data, dict):
                 tokens.update({str(name): str(token) for name, token in data.items() if token})
-        except Exception:
-            pass  # AGENT_TOKENS가 깨져 있어도 GitHub 쪽은 정상 동작하게 넘어간다
+            else:
+                print(f"[AGENT_TOKENS] 경고: JSON은 파싱됐지만 객체({{...}}) 형태가 아닙니다 "
+                      f"(실제 타입: {type(data).__name__}) - 이 값은 무시됩니다.", flush=True)
+        except Exception as e:
+            # AGENT_TOKENS가 깨져 있어도 GitHub 쪽은 정상 동작하게 넘어가되, Render
+            # 대시보드 Logs 탭에서 바로 원인을 볼 수 있게 남긴다. 흔한 원인: 작은따옴표
+            # 사용(JSON은 큰따옴표만 허용), 쉼표 누락/중복, 앞뒤에 잘못 붙은 따옴표.
+            print(f"[AGENT_TOKENS] 파싱 실패 - 이 환경변수의 모든 토큰이 무시됩니다: {e}", flush=True)
 
     now = time.time()
     if now - _gh_cache["fetched_at"] > _GH_CACHE_TTL_SEC:
         try:
             _gh_cache["data"] = _fetch_agent_tokens_from_github()
             _gh_cache["fetched_at"] = now
-        except Exception:
-            pass  # 조회 실패(네트워크/권한 등) 시 마지막으로 성공했던 캐시를 그대로 쓴다
+        except Exception as e:
+            # 조회 실패(네트워크/권한/경로·브랜치 오타 등) 시 마지막으로 성공했던
+            # 캐시를 그대로 쓰되, Render 대시보드 Logs 탭에서 원인을 바로 볼 수
+            # 있게 남긴다. 흔한 원인: PAT 권한 부족/만료, repo·path·branch 오타.
+            print(f"[AGENT_TOKENS/GitHub] agents.json 조회 실패: {e}", flush=True)
     tokens.update(_gh_cache["data"])
 
     return tokens
