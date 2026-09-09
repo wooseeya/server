@@ -404,10 +404,27 @@ async def proxy(request: Request, authorization: str = Header(default="")):
             raise HTTPException(status_code=502, detail=f"서버에 {rule['env']}가 설정되어 있지 않습니다.")
         params[rule["name"]] = real_value
     elif rule["type"] == "query_multi":
+        missing = []
         for field_name, env_name in rule["fields"]:
             real_value = os.environ.get(env_name, "")
             if real_value:
                 params[field_name] = real_value
+            else:
+                missing.append(env_name)
+        if missing:
+            # 예전엔 여기서 없는 값은 그냥 건너뛰고 조용히 넘어갔다 - 그러면
+            # VWorld처럼 key/domain 둘 다 필요한 API는, Render에 VWORLD_KEY나
+            # VWORLD_DOMAIN 중 하나만 빠져도 "키 없이" 또는 "호출부가 보낸(로컬
+            # 기본값) domain으로" 그대로 VWorld에 요청이 나가버렸다. VWorld는
+            # 이 경우 502가 아니라 자체 인증 오류를 담은 200 응답을 주는 경우가
+            # 많아서, 결과적으로 "서버 설정이 빠졌다"는 사실 자체가 어디에도
+            # 드러나지 않고 그냥 "정보 없음"으로만 보이는 문제가 있었다. 이제
+            # Render 쪽 환경변수가 실제로 빠졌으면 여기서 바로 502로 명확히
+            # 알린다.
+            raise HTTPException(
+                status_code=502,
+                detail=f"서버에 {', '.join(missing)}가 설정되어 있지 않습니다.",
+            )
 
     try:
         async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC) as client:
