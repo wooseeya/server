@@ -1,7 +1,7 @@
 """매물 검증 데스크용 원격 키 서버 (Render 배포용) - 프록시 버전.
 
 이 파일은 launcher.py/main.py가 있는 프로젝트와는 완전히 별개의, 아주 작은
-FastAPI 앱이다. 하는 일은 네 가지다:
+FastAPI 앱이다. 하는 일은 다섯 가지다:
   - GET  /keys          : 올바른 "중개사 토큰"으로 요청하면 API 키 JSON을 돌려준다.
                            (v0.9부터 main.py는 여기서 실제 키를 받아 저장하지
                            않고, KAKAO_JS_KEY만 골라 쓴다 - 아래 설명 참고.)
@@ -16,8 +16,25 @@ FastAPI 앱이다. 하는 일은 네 가지다:
                            anthropic SDK가 base_url을 이 서버로 바꿔서 그대로
                            호출하면, 여기서 진짜 ANTHROPIC_API_KEY로 바꿔치기해
                            실제 Anthropic API에 넘긴다.
-  - GET  /agents         : 관리자 토큰(ADMIN_TOKEN)으로만 등록된 중개사 이름
-                           목록을 보여준다(토큰 값 자체는 절대 안 보여줌).
+  - GET  /token-info     : 지금 쓰는 토큰의 만료일/남은 일수를 알려준다. 이미
+                           만료된 토큰이어도(그 토큰 자체가 한 번이라도 등록된
+                           적 있다면) 조회는 허용한다 - 그래야 만료 후에도
+                           launcher.py가 "언제까지였는지"를 사용자에게 보여줄
+                           수 있다. /proxy, /v1/messages, /keys는 만료된 토큰을
+                           그대로 거부한다(v0.11부터).
+  - GET  /agents         : 관리자 토큰(ADMIN_TOKEN)으로만 등록된 중개사 이름/
+                           만료일 목록을 보여준다(토큰 값 자체는 절대 안 보여줌).
+
+★ v0.11부터: 중개사별 토큰에 만료일(expires)을 선택적으로 붙일 수 있다.
+AGENT_TOKENS/agents.json의 값은 지금까지처럼 토큰 문자열 하나만 써도 되고
+(그 경우 무기한), 아래처럼 객체로 써서 만료일을 지정할 수도 있다:
+    {
+      "강남공인중개사": {"token": "9f3a1c2b...", "expires": "2026-12-31"},
+      "분당부동산": "77b2e4a1..."   // 문자열 그대로 쓰면 무기한
+    }
+expires는 "YYYY-MM-DD" 형식이며, 그날 자정(UTC)이 지나면 만료로 처리한다.
+형식이 잘못됐으면(오타 등) 안전하게 "무기한"으로 취급한다 - 관리자 실수로
+전체 중개사가 갑자기 차단되는 사고를 막기 위함이다.
 
 ★ 왜 이렇게 바꿨는가: 처음 버전(v0.7 이하)은 /keys가 실제 키 값 자체를
 중개사 PC에 내려줬다. launcher.py가 그 값을 오프라인 대비용으로 로컬
@@ -132,22 +149,55 @@ def _fetch_agent_tokens_from_github() -> dict:
     data = json.loads(raw)
     if not isinstance(data, dict):
         return {}
-    return {str(name): str(token) for name, token in data.items() if token}
+    return {str(name): entry for name, entry in data.items() if entry}
+
+
+def _normalize_entries(raw: dict) -> dict:
+    """AGENT_TOKENS/agents.json 원본(값이 토큰 문자열이거나 {"token","expires"}
+    객체일 수 있음)을 공통 스키마 {"token": str, "expires": str|None}로 정리한다.
+    문자열 그대로 쓴 기존 항목은 expires=None(무기한)으로 취급해 하위호환된다."""
+    out: dict = {}
+    for name, entry in raw.items():
+        if isinstance(entry, str):
+            if entry:
+                out[str(name)] = {"token": entry, "expires": None}
+        elif isinstance(entry, dict):
+            token = str(entry.get("token") or "")
+            if token:
+                out[str(name)] = {"token": token, "expires": entry.get("expires") or None}
+    return out
+
+
+def _is_expired(expires: str | None) -> bool:
+    """expires("YYYY-MM-DD")가 오늘(UTC) 이전이면 True. expires가 없거나 형식이
+    잘못됐으면(관리자 오타 등) 안전하게 False(무기한 취급) - 형식 오류 하나로
+    전체 인증이 막히는 사고를 막기 위함이다."""
+    if not expires:
+        return False
+    try:
+        exp_date = datetime.strptime(expires, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"[AGENT_TOKENS] 경고: expires 형식이 잘못됨({expires!r}) - 무기한으로 취급합니다.", flush=True)
+        return False
+    return datetime.now(timezone.utc).date() > exp_date
 
 
 def _load_agent_tokens() -> dict:
     """AGENT_TOKENS(Render 환경변수, 소규모용)와 GitHub의 agents.json(대규모용)을
     합쳐서 반환한다. 두 곳에 같은 이름이 있으면 GitHub 쪽 값이 우선한다(나중에
     update한 dict가 이긴다). 매 요청마다 새로 읽되, GitHub 쪽만 캐시를 둔다
-    (환경변수 읽기는 원래도 즉시 반영되고 비용이 없으므로 캐시가 필요 없다)."""
-    tokens: dict = {}
+    (환경변수 읽기는 원래도 즉시 반영되고 비용이 없으므로 캐시가 필요 없다).
+    반환값은 {"중개사이름": {"token": str, "expires": str|None}} 형태로 정규화돼
+    있다 - 호출부(_authenticate, /agents, /token-info)는 값이 문자열이던 시절과
+    객체인 지금을 구분할 필요가 없다."""
+    raw: dict = {}
 
-    raw = os.environ.get("AGENT_TOKENS", "")
-    if raw.strip():
+    env_raw = os.environ.get("AGENT_TOKENS", "")
+    if env_raw.strip():
         try:
-            data = json.loads(raw)
+            data = json.loads(env_raw)
             if isinstance(data, dict):
-                tokens.update({str(name): str(token) for name, token in data.items() if token})
+                raw.update({str(name): entry for name, entry in data.items() if entry})
             else:
                 print(f"[AGENT_TOKENS] 경고: JSON은 파싱됐지만 객체({{...}}) 형태가 아닙니다 "
                       f"(실제 타입: {type(data).__name__}) - 이 값은 무시됩니다.", flush=True)
@@ -167,9 +217,18 @@ def _load_agent_tokens() -> dict:
             # 캐시를 그대로 쓰되, Render 대시보드 Logs 탭에서 원인을 바로 볼 수
             # 있게 남긴다. 흔한 원인: PAT 권한 부족/만료, repo·path·branch 오타.
             print(f"[AGENT_TOKENS/GitHub] agents.json 조회 실패: {e}", flush=True)
-    tokens.update(_gh_cache["data"])
+    raw.update(_gh_cache["data"])
 
-    return tokens
+    return _normalize_entries(raw)
+
+
+def _find_entry_by_token(provided: str):
+    """제공된 토큰 문자열과 일치하는 항목을 찾는다. (이름, {"token","expires"}) |
+    None(등록된 적 없는 토큰)."""
+    for name, entry in _load_agent_tokens().items():
+        if provided == entry["token"]:
+            return name, entry
+    return None
 
 
 def _authenticate(token_or_header: str) -> str:
@@ -177,17 +236,21 @@ def _authenticate(token_or_header: str) -> str:
     401을 던진다. "Bearer xxx"(Authorization 헤더) 형태와 값 자체("xxx",
     anthropic SDK가 보내는 x-api-key 헤더처럼 접두어가 없는 형태) 둘 다
     받아들인다. 어떤 중개사인지, 존재하는 이름인지 등은 에러 메시지에 절대
-    노출하지 않는다(토큰 추측 공격에 힌트를 주지 않기 위함)."""
+    노출하지 않는다(토큰 추측 공격에 힌트를 주지 않기 위함) - 단, 만료 여부는
+    본인이 이미 알고 있는 자기 토큰에 대한 정보이므로 예외적으로 안내한다."""
     provided = token_or_header[7:] if token_or_header.startswith("Bearer ") else token_or_header
     if not provided:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    for name, token in _load_agent_tokens().items():
-        if provided == token:
-            return name
+    found = _find_entry_by_token(provided)
+    if found:
+        name, entry = found
+        if _is_expired(entry["expires"]):
+            raise HTTPException(status_code=401, detail="토큰이 만료되었습니다. 담당자에게 갱신을 요청하세요.")
+        return name
 
     # 레거시 폴백: 예전 방식(중개사 구분 없는 단일 토큰)으로 이미 배포된 exe가
-    # 있다면 ACCESS_TOKEN 환경변수를 지우기 전까지는 계속 동작한다.
+    # 있다면 ACCESS_TOKEN 환경변수를 지우기 전까지는 계속 동작한다. (만료 개념 없음)
     legacy_token = os.environ.get("ACCESS_TOKEN", "")
     if legacy_token and provided == legacy_token:
         return "(레거시 공용 토큰)"
@@ -210,9 +273,46 @@ async def get_keys(authorization: str = Header(default="")):
     return {name: os.environ.get(name, "") for name in KEY_NAMES}
 
 
+@app.get("/token-info")
+async def token_info(authorization: str = Header(default="")):
+    """지금 쓰고 있는 토큰의 만료일/남은 일수를 알려준다. launcher.py가 실행할
+    때마다 조용히 호출해서, 만료가 임박했거나 이미 지났으면 중개사 화면에 안내를
+    띄우는 데 쓴다. /proxy, /v1/messages, /keys와 달리 이미 만료된 토큰이어도
+    (그 토큰 자체가 한 번이라도 등록된 적 있다면) 조회는 허용한다 - 그래야 만료된
+    뒤에도 중개사가 "언제까지였는지"를 스스로 확인하고 담당자에게 갱신을 요청할
+    수 있다. 등록된 적 자체가 없는 토큰(오타 등)은 다른 엔드포인트와 동일하게
+    401로 거부한다.
+
+    응답: {"agent": str, "expires": "YYYY-MM-DD"|None, "days_left": int|None,
+           "expired": bool}
+    expires가 None이면 무기한 토큰이라는 뜻이고, 이때 days_left도 None이다."""
+    provided = authorization[7:] if authorization.startswith("Bearer ") else authorization
+    if not provided:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    found = _find_entry_by_token(provided)
+    if found:
+        name, entry = found
+        expires = entry["expires"]
+        if not expires:
+            return {"agent": name, "expires": None, "days_left": None, "expired": False}
+        try:
+            exp_date = datetime.strptime(expires, "%Y-%m-%d").date()
+        except ValueError:
+            return {"agent": name, "expires": expires, "days_left": None, "expired": False}
+        days_left = (exp_date - datetime.now(timezone.utc).date()).days
+        return {"agent": name, "expires": expires, "days_left": days_left, "expired": days_left < 0}
+
+    legacy_token = os.environ.get("ACCESS_TOKEN", "")
+    if legacy_token and provided == legacy_token:
+        return {"agent": "(레거시 공용 토큰)", "expires": None, "days_left": None, "expired": False}
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @app.get("/agents")
 async def list_agents(authorization: str = Header(default=""), refresh: bool = False):
-    """등록된 중개사 이름 목록만 보여준다(토큰 값은 절대 포함하지 않음).
+    """등록된 중개사 이름과 만료일 목록을 보여준다(토큰 값은 절대 포함하지 않음).
     AGENT_TOKENS나 GitHub의 agents.json을 방금 수정한 뒤 제대로 반영됐는지
     확인하는 용도. ADMIN_TOKEN 환경변수를 별도로 등록해야 쓸 수 있다
     (설정 안 했으면 항상 401).
@@ -225,7 +325,12 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
         raise HTTPException(status_code=401, detail="Unauthorized")
     if refresh:
         _gh_cache["fetched_at"] = 0.0
-    return {"agents": sorted(_load_agent_tokens().keys())}
+    return {
+        "agents": [
+            {"name": name, "expires": entry["expires"], "expired": _is_expired(entry["expires"])}
+            for name, entry in sorted(_load_agent_tokens().items())
+        ]
+    }
 
 
 # ---------------------------------------------------------------------------
