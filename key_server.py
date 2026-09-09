@@ -86,6 +86,7 @@ Render 대시보드의 Environment 탭 또는 아래 설명할 GitHub 저장소�
 
 import json
 import os
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -340,6 +341,28 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
 
 _PROXY_TIMEOUT_SEC = 20.0
 
+# api.vworld.kr은 (2026-09 확인) 최신 Linux(OpenSSL 3.x) 환경의 기본 보안수준
+# (SECLEVEL=2)에서 거부되는 구형 TLS 암호(SEED 계열 등)로만 응답하려는 것으로
+# 보인다 - 그 결과 TLS 핸드셰이크 단계에서 그대로 연결이 끊겨 httpx가
+# "Server disconnected without sending a response"(RemoteProtocolError)를
+# 낸다. Windows(로컬 배포판, 다른 TLS 스택 사용)에서는 재현되지 않고 Render 같은
+# Linux 서버에서만 재현되는 게 이 증상의 특징이다. 이 호스트로 나가는 호출에
+# 한해서만 보안수준을 1로 낮춰 구형 암호도 허용한다(다른 호스트 호출에는 영향
+# 없음 - httpx.AsyncClient를 호출부마다 새로 만들기 때문에 완전히 격리된다).
+_VWORLD_HOST = "api.vworld.kr"
+
+
+def _ssl_context_for_host(host: str) -> ssl.SSLContext | None:
+    if host != _VWORLD_HOST:
+        return None
+    ctx = ssl.create_default_context()
+    try:
+        ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+    except ssl.SSLError:
+        pass
+    return ctx
+
+
 # 호스트별로 "실제 키를 요청의 어디에 꽂아 넣을지"를 정의한다. 호출부는 이 값
 # 없이(또는 빈 값으로) 요청을 만들어 보내고, 여기서 실제 값으로 덮어쓴다 -
 # 그래서 호출부가 보낸 값은 어차피 무시되므로 아무 문자열이나 넣어 보내도 된다.
@@ -426,8 +449,9 @@ async def proxy(request: Request, authorization: str = Header(default="")):
                 detail=f"서버에 {', '.join(missing)}가 설정되어 있지 않습니다.",
             )
 
+    verify_option = _ssl_context_for_host(host) or True
     try:
-        async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC) as client:
+        async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC, verify=verify_option) as client:
             resp = await client.request(method, url, params=params, headers=headers, json=json_body)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"대상 API 호출 실패: {e}")
