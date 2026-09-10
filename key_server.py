@@ -383,6 +383,9 @@ _PROXY_HOST_RULES = {
     "api.vworld.kr": {
         # VWorld는 key와 domain 둘 다 필요하다 - domain은 VWorld 콘솔에 등록해둔
         # 실제 서비스 도메인(또는 로컬 테스트용 localhost)이어야 한다.
+        # ※ NCP_RELAY_URL이 설정돼 있으면 이 규칙까지 오지 않고 위에서 한국
+        # 중계 서버로 위임되므로, 그 경우엔 VWORLD_KEY/VWORLD_DOMAIN을 Render에
+        # 둘 필요가 없다(중계 서버 쪽 환경변수로만 있으면 됨).
         "type": "query_multi", "fields": [
             ("key", "VWORLD_KEY"), ("domain", "VWORLD_DOMAIN"),
         ],
@@ -415,6 +418,35 @@ async def proxy(request: Request, authorization: str = Header(default="")):
     rule = _PROXY_HOST_RULES.get(host)
     if not rule:
         raise HTTPException(status_code=403, detail=f"허용되지 않은 대상 호스트입니다: {host}")
+
+    # ── VWorld 전용: 한국 리전 중계 서버로 위임 (설정돼 있으면) ─────────────────
+    # api.vworld.kr이 해외 IP를 차단하는 것으로 보여, NCP_RELAY_URL이 설정돼
+    # 있으면 여기서 직접 호출하지 않고 한국 VM(vworld_relay.py)에 그대로
+    # 넘긴다 - VWORLD_KEY/VWORLD_DOMAIN도 이제 Render가 아니라 그 VM에만
+    # 있으면 된다(아래 query_multi 분기는 그래서 여기 도달하지 않는다).
+    # NCP_RELAY_URL이 비어 있으면(아직 중계 서버를 안 만든 경우) 기존처럼
+    # Render가 직접 호출을 시도한다(_ssl_context_for_host의 SECLEVEL 완화만
+    # 적용된 채로) - 두 방법 중 뭐가 실제로 먹히는지 순서대로 시험해볼 수 있다.
+    if host == _VWORLD_HOST:
+        relay_url = os.environ.get("NCP_RELAY_URL", "").strip()
+        relay_token = os.environ.get("NCP_RELAY_TOKEN", "")
+        if relay_url:
+            try:
+                async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC) as client:
+                    resp = await client.post(
+                        f"{relay_url.rstrip('/')}/relay",
+                        json={"url": url, "method": method, "params": params, "headers": headers},
+                        headers={"Authorization": f"Bearer {relay_token}"},
+                    )
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {e}")
+
+            print(f"[proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
+                  f"host={host} via=relay status={resp.status_code}", flush=True)
+            return Response(
+                content=resp.content, status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/octet-stream"),
+            )
 
     if rule["type"] == "header":
         real_value = os.environ.get(rule["env"], "")
