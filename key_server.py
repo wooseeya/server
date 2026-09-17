@@ -119,7 +119,7 @@ KEY_NAMES = [
 # 새로 읽지 않고 캐시를 그대로 쓴다. 그만큼 GitHub에서 파일을 고친 게 반영되는 데
 # 최대 이 시간만큼 지연될 수 있다는 뜻이기도 하다.
 _GH_CACHE_TTL_SEC = 30
-_gh_cache = {"data": {}, "fetched_at": 0.0}
+_gh_cache = {"data": {}, "fetched_at": 0.0, "last_error": None, "last_success_at": None}
 
 
 def _fetch_agent_tokens_from_github() -> dict:
@@ -222,10 +222,20 @@ def _load_agent_tokens() -> dict:
         try:
             _gh_cache["data"] = _fetch_agent_tokens_from_github()
             _gh_cache["fetched_at"] = now
+            _gh_cache["last_error"] = None
+            _gh_cache["last_success_at"] = now
         except Exception as e:
             # 조회 실패(네트워크/권한/경로·브랜치 오타 등) 시 마지막으로 성공했던
             # 캐시를 그대로 쓰되, Render 대시보드 Logs 탭에서 원인을 바로 볼 수
             # 있게 남긴다. 흔한 원인: PAT 권한 부족/만료, repo·path·branch 오타.
+            # ⚠ fetched_at을 갱신 안 해서(실패했으니) 다음 요청에서도 바로 다시
+            # 시도하게 되는데, 이러면 실패가 계속될 때 "언제 마지막으로 성공했는지"
+            # 를 로그만 보고는 알기 어렵다 - last_error/last_success_at을 따로
+            # 남겨서 /agents(관리자 전용)로 바로 확인할 수 있게 한다. 실제로
+            # "만료일을 설정했는데도 계속 통과된다"는 문의가 있었는데, 원인이
+            # 바로 이 조회가 계속 조용히 실패해서 만료일 추가 전의 옛날 캐시를
+            # 계속 쓰고 있었던 경우였다.
+            _gh_cache["last_error"] = str(e)
             print(f"[AGENT_TOKENS/GitHub] agents.json 조회 실패: {e}", flush=True)
     raw.update(_gh_cache["data"])
 
@@ -335,11 +345,25 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
         raise HTTPException(status_code=401, detail="Unauthorized")
     if refresh:
         _gh_cache["fetched_at"] = 0.0
+    agents = sorted(_load_agent_tokens().items())  # _load_agent_tokens()를 먼저 호출해야
+    # 위 refresh 처리로 리셋된 fetched_at을 보고 실제로 다시 조회를 시도하고,
+    # 그 결과(성공/실패)가 last_error/last_success_at에 반영된 "다음"이다 -
+    # 순서를 바꾸면 방금 시도한 조회 결과가 아니라 그 이전 상태를 보여주게 된다.
     return {
         "agents": [
             {"name": name, "expires": entry["expires"], "expired": _is_expired(entry["expires"])}
-            for name, entry in sorted(_load_agent_tokens().items())
-        ]
+            for name, entry in agents
+        ],
+        # GitHub agents.json 조회 자체가 잘 되고 있는지 - "만료일을 설정했는데도
+        # 계속 통과된다"는 문의의 원인이 대부분 여기(조회가 조용히 계속 실패해서
+        # 옛날 캐시를 쓰고 있음)였어서, 관리자가 바로 확인할 수 있게 노출한다.
+        "github_fetch": {
+            "last_success_at": (
+                datetime.fromtimestamp(_gh_cache["last_success_at"], KST).isoformat()
+                if _gh_cache["last_success_at"] else None
+            ),
+            "last_error": _gh_cache["last_error"],  # None이면 마지막 시도가 성공했다는 뜻
+        },
     }
 
 
