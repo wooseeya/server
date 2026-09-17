@@ -91,7 +91,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+KST = timezone(timedelta(hours=9))  # 만료일(expires) 판정은 한국 시간 기준으로 한다 -
+# UTC 기준으로 하면 한국 날짜로는 이미 만료일 다음날이 됐어도 UTC로는 아직 자정
+# 전이라(최대 9시간) 만료 처리가 늦게 걸리는 문제가 있었다(실제 문의로 확인됨).
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -170,9 +174,14 @@ def _normalize_entries(raw: dict) -> dict:
 
 
 def _is_expired(expires: str | None) -> bool:
-    """expires("YYYY-MM-DD")가 오늘(UTC) 이전이면 True. expires가 없거나 형식이
-    잘못됐으면(관리자 오타 등) 안전하게 False(무기한 취급) - 형식 오류 하나로
-    전체 인증이 막히는 사고를 막기 위함이다."""
+    """expires("YYYY-MM-DD")가 오늘(한국시간 KST) 이전이면 True. expires가 없거나
+    형식이 잘못됐으면(관리자 오타 등) 안전하게 False(무기한 취급) - 형식 오류
+    하나로 전체 인증이 막히는 사고를 막기 위함이다.
+
+    ⚠ 판정 기준은 KST(UTC+9)다 - UTC로 판정하면 한국 날짜로는 이미 만료일
+    다음날이 됐어도 UTC 자정 전(한국시간 오전 9시 전)까지는 만료 처리가 안
+    되는 최대 9시간의 지연이 생겨서, 실제로 "만료일을 지났는데 왜 아직 되냐"는
+    문의가 있었다."""
     if not expires:
         return False
     try:
@@ -180,7 +189,7 @@ def _is_expired(expires: str | None) -> bool:
     except ValueError:
         print(f"[AGENT_TOKENS] 경고: expires 형식이 잘못됨({expires!r}) - 무기한으로 취급합니다.", flush=True)
         return False
-    return datetime.now(timezone.utc).date() > exp_date
+    return datetime.now(KST).date() > exp_date
 
 
 def _load_agent_tokens() -> dict:
@@ -301,7 +310,7 @@ async def token_info(authorization: str = Header(default="")):
             exp_date = datetime.strptime(expires, "%Y-%m-%d").date()
         except ValueError:
             return {"agent": name, "expires": expires, "days_left": None, "expired": False}
-        days_left = (exp_date - datetime.now(timezone.utc).date()).days
+        days_left = (exp_date - datetime.now(KST).date()).days
         return {"agent": name, "expires": expires, "days_left": days_left, "expired": days_left < 0}
 
     legacy_token = os.environ.get("ACCESS_TOKEN", "")
