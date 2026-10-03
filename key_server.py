@@ -2,9 +2,11 @@
 
 이 파일은 launcher.py/main.py가 있는 프로젝트와는 완전히 별개의, 아주 작은
 FastAPI 앱이다. 하는 일은 다섯 가지다:
-  - GET  /keys          : 올바른 "중개사 토큰"으로 요청하면 API 키 JSON을 돌려준다.
-                           (v0.9부터 main.py는 여기서 실제 키를 받아 저장하지
-                           않고, KAKAO_JS_KEY만 골라 쓴다 - 아래 설명 참고.)
+  - GET  /keys          : 올바른 "중개사 토큰"으로 요청하면 KAKAO_JS_KEY(지도 표시용,
+                           어차피 브라우저에 노출되는 공개 키) "하나만" 돌려준다.
+                           ★ v1.1부터: 예전에는 ANTHROPIC_API_KEY 등 실제 키까지 전부
+                           내려줘서, 토큰만 있으면 curl로 직접 호출해 모든 키를 꺼낼 수
+                           있었다 - 이제는 공개해도 되는 값만 돌려준다.
   - POST /proxy          : 카카오/공공데이터/VWorld API 호출을 "대신" 해준다.
                            main.py(geocode.py/building_ledger.py/land_ledger.py/
                            molit.py)는 실제 키 없이 여기로 요청을 보내고, 이
@@ -35,6 +37,18 @@ AGENT_TOKENS/agents.json의 값은 지금까지처럼 토큰 문자열 하나만
 expires는 "YYYY-MM-DD" 형식이며, 그날 자정(UTC)이 지나면 만료로 처리한다.
 형식이 잘못됐으면(오타 등) 안전하게 "무기한"으로 취급한다 - 관리자 실수로
 전체 중개사가 갑자기 차단되는 사고를 막기 위함이다.
+
+★ v1.1 보안 보강 - 새로 쓸 수 있는 환경변수 (전부 선택, 안 쓰면 기본값):
+    ANTHROPIC_ALLOWED_MODELS  허용할 모델 이름 목록(쉼표 구분). 비우면 모델 제한 없음.
+                              예: "claude-sonnet-4-5,claude-haiku-4-5"
+                              (처음엔 비워두고 Logs의 [anthropic-proxy] model= 값을
+                              확인한 뒤, 실제 쓰는 모델만 적어 넣는 것을 권장)
+    ANTHROPIC_MAX_TOKENS_CAP  요청 하나당 max_tokens 상한. 기본 8192, 0이면 제한 없음.
+                              넘는 요청은 거부하지 않고 이 값으로 낮춰서 보낸다.
+    ANTHROPIC_DAILY_LIMIT     중개사 1명당 하루(KST) Claude 호출 횟수. 기본 500, 0=무제한.
+    PROXY_DAILY_LIMIT         중개사 1명당 하루(KST) /proxy 호출 횟수. 기본 5000, 0=무제한.
+  ※ 횟수 제한은 서버 메모리에만 저장된다 - Render가 재시작/슬립되면 0으로 초기화된다.
+    "절대 한도"가 필요하면 Anthropic 콘솔의 월 사용 한도를 반드시 함께 걸어둘 것.
 
 ★ 왜 이렇게 바꿨는가: 처음 버전(v0.7 이하)은 /keys가 실제 키 값 자체를
 중개사 PC에 내려줬다. launcher.py가 그 값을 오프라인 대비용으로 로컬
@@ -84,6 +98,7 @@ Render 대시보드의 Environment 탭 또는 아래 설명할 GitHub 저장소�
     curl -H "Authorization: Bearer test123" http://127.0.0.1:8000/keys
 """
 
+import hmac
 import json
 import os
 import ssl
@@ -103,15 +118,12 @@ from fastapi.responses import Response
 
 app = FastAPI(title="매물 검증 데스크 - 원격 키 서버")
 
-# launcher.py의 SETTING_KEYS와 정확히 같은 이름을 써야 한다 - 이름이 다르면
-# launcher.py가 응답을 받고도 값을 못 채워넣는다.
-KEY_NAMES = [
-    "ANTHROPIC_API_KEY",
-    "KAKAO_KEY",
+# /keys로 내려줘도 되는 값의 목록. launcher.py의 SETTING_KEYS와 같은 이름을 써야 한다.
+# ★ 여기에는 "브라우저 화면에 어차피 노출되는 값"만 넣는다. 실제 서비스 키
+#   (ANTHROPIC_API_KEY/KAKAO_KEY/DATA_SERVICE_KEY/VWORLD_KEY)를 여기에 다시 넣으면
+#   토큰을 가진 누구나 curl로 그 키를 꺼내 갈 수 있으므로 절대 추가하지 말 것.
+PUBLIC_KEY_NAMES = [
     "KAKAO_JS_KEY",   # 지도 "표시"용 - KAKAO_KEY(REST, 주소변환용)와는 다른 별도 키
-    "DATA_SERVICE_KEY",
-    "VWORLD_KEY",
-    "VWORLD_DOMAIN",
 ]
 
 # GitHub에서 읽어온 agents.json을 잠깐 기억해두는 캐시. 요청마다 매번 GitHub API를
@@ -242,16 +254,67 @@ def _load_agent_tokens() -> dict:
     return _normalize_entries(raw)
 
 
+def _tokens_equal(a: str, b: str) -> bool:
+    """토큰 비교를 "일치하는 순간 바로 끝나는" == 대신 일정한 시간이 걸리는
+    hmac.compare_digest로 한다(응답 시간 차이로 토큰을 한 글자씩 추측하는 공격 방지).
+    str을 그대로 넣으면 한글 등 비ASCII 문자에서 TypeError가 나므로 bytes로 바꿔 비교한다."""
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def _env_int(name: str, default: int) -> int:
+    """정수 환경변수 읽기. 비었거나 숫자가 아니면(오타 등) 기본값을 쓰고 로그를 남긴다."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[설정] 경고: {name}={raw!r}는 정수가 아니어서 기본값 {default}을 씁니다.", flush=True)
+        return default
+
+
+def _client_ip(request: Request | None) -> str:
+    """로그용 접속 IP. Render 같은 프록시 뒤에서는 X-Forwarded-For에 값이 여러 개일 수
+    있고 그 앞쪽은 클라이언트가 위조할 수 있으므로, 어느 항목을 믿을지 단정하지 않고
+    헤더 전체를 (잘라서) 그대로 남긴다 - 로그를 볼 때 참고용으로만 쓴다."""
+    if request is None:
+        return "-"
+    xff = request.headers.get("x-forwarded-for", "").strip()
+    if xff:
+        return xff[:200]
+    return request.client.host if request.client else "-"
+
+
+# 중개사별 일일 호출 횟수 {(중개사이름, 구분): (날짜KST, 횟수)}. 서버 메모리에만 있어서
+# 재시작/슬립 시 초기화된다(위 docstring 참고). await 없이 동작하므로 동시 요청에도 안전하다.
+_usage: dict = {}
+
+
+def _check_quota(agent_name: str, bucket: str, limit: int) -> None:
+    """limit이 0 이하면 무제한. 오늘(KST) 이미 limit회 불렀으면 429를 던진다."""
+    if limit <= 0:
+        return
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    day, count = _usage.get((agent_name, bucket), (today, 0))
+    if day != today:
+        day, count = today, 0
+    if count >= limit:
+        print(f"[quota] agent={agent_name} bucket={bucket} 일일 한도({limit}) 초과", flush=True)
+        raise HTTPException(status_code=429, detail="오늘 사용 한도를 초과했습니다. 내일 다시 시도하거나 담당자에게 문의하세요.")
+    _usage[(agent_name, bucket)] = (day, count + 1)
+
+
 def _find_entry_by_token(provided: str):
     """제공된 토큰 문자열과 일치하는 항목을 찾는다. (이름, {"token","expires"}) |
-    None(등록된 적 없는 토큰)."""
+    None(등록된 적 없는 토큰). 일치 여부와 상관없이 전체를 끝까지 비교한다."""
+    found = None
     for name, entry in _load_agent_tokens().items():
-        if provided == entry["token"]:
-            return name, entry
-    return None
+        if _tokens_equal(provided, entry["token"]) and found is None:
+            found = (name, entry)
+    return found
 
 
-def _authenticate(token_or_header: str) -> str:
+def _authenticate(token_or_header: str, request: Request | None = None) -> str:
     """토큰 문자열을 검사해 통과하면 중개사 이름(식별자)을 반환하고, 실패하면
     401을 던진다. "Bearer xxx"(Authorization 헤더) 형태와 값 자체("xxx",
     anthropic SDK가 보내는 x-api-key 헤더처럼 접두어가 없는 형태) 둘 다
@@ -266,15 +329,26 @@ def _authenticate(token_or_header: str) -> str:
     if found:
         name, entry = found
         if _is_expired(entry["expires"]):
+            print(f"[auth-fail] {datetime.now(timezone.utc).isoformat()} reason=expired "
+                  f"agent={name} ip={_client_ip(request)}", flush=True)
             raise HTTPException(status_code=401, detail="토큰이 만료되었습니다. 담당자에게 갱신을 요청하세요.")
         return name
 
     # 레거시 폴백: 예전 방식(중개사 구분 없는 단일 토큰)으로 이미 배포된 exe가
     # 있다면 ACCESS_TOKEN 환경변수를 지우기 전까지는 계속 동작한다. (만료 개념 없음)
+    # ⚠ 이 토큰은 만료도, 중개사별 폐기도 안 된다 - 더 이상 쓰는 exe가 없으면 Render에서
+    #   ACCESS_TOKEN 환경변수를 삭제할 것. 쓰이는 동안은 로그에 경고를 남긴다.
     legacy_token = os.environ.get("ACCESS_TOKEN", "")
-    if legacy_token and provided == legacy_token:
+    if legacy_token and _tokens_equal(provided, legacy_token):
+        print(f"[auth] 경고: 레거시 공용 토큰으로 접근함 (만료/개별 폐기 불가) "
+              f"ip={_client_ip(request)}", flush=True)
         return "(레거시 공용 토큰)"
 
+    # 토큰 값 자체는 절대 로그에 남기지 않는다. 실패 기록은 무차별 대입 시도를 눈으로
+    # 확인하는 용도이며, 자동 차단은 하지 않는다(프록시 뒤에서는 IP를 정확히 특정할 수
+    # 없어서, 공격자가 일부러 실패를 쌓아 정상 중개사까지 막는 사고가 날 수 있다).
+    print(f"[auth-fail] {datetime.now(timezone.utc).isoformat()} reason=invalid "
+          f"ip={_client_ip(request)}", flush=True)
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -285,12 +359,13 @@ async def health():
 
 
 @app.get("/keys")
-async def get_keys(authorization: str = Header(default="")):
-    agent_name = _authenticate(authorization)
+async def get_keys(request: Request, authorization: str = Header(default="")):
+    agent_name = _authenticate(authorization, request)
     # Render 로그(대시보드 Logs 탭)에서 "누가 언제 키를 받아갔는지" 확인할 수
     # 있게 남겨둔다 - 이상 사용 감지(예: 새벽에 몰아서 대량 조회 등)에 도움된다.
     print(f"[keys] {datetime.now(timezone.utc).isoformat()} agent={agent_name}", flush=True)
-    return {name: os.environ.get(name, "") for name in KEY_NAMES}
+    # ★ 공개해도 되는 값(PUBLIC_KEY_NAMES)만 돌려준다. 실제 서비스 키는 절대 내려주지 않는다.
+    return {name: os.environ.get(name, "") for name in PUBLIC_KEY_NAMES}
 
 
 @app.get("/token-info")
@@ -324,7 +399,7 @@ async def token_info(authorization: str = Header(default="")):
         return {"agent": name, "expires": expires, "days_left": days_left, "expired": days_left < 0}
 
     legacy_token = os.environ.get("ACCESS_TOKEN", "")
-    if legacy_token and provided == legacy_token:
+    if legacy_token and _tokens_equal(provided, legacy_token):
         return {"agent": "(레거시 공용 토큰)", "expires": None, "days_left": None, "expired": False}
 
     raise HTTPException(status_code=401, detail="Unauthorized")
@@ -341,7 +416,7 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
     방금 agents.json을 고치고 바로 반영됐는지 확인하고 싶을 때 쓴다."""
     admin_token = os.environ.get("ADMIN_TOKEN", "")
     provided = authorization[7:] if authorization.startswith("Bearer ") else ""
-    if not admin_token or provided != admin_token:
+    if not admin_token or not _tokens_equal(provided, admin_token):
         raise HTTPException(status_code=401, detail="Unauthorized")
     if refresh:
         _gh_cache["fetched_at"] = 0.0
@@ -426,6 +501,46 @@ _PROXY_HOST_RULES = {
 }
 
 
+# 클라이언트가 보낸 headers 중 그대로 전달하면 안 되는 것들. Authorization은 서버가
+# 필요한 곳(카카오)에서 직접 다시 채우므로 클라이언트 값은 어느 경우에도 버린다.
+_BLOCKED_REQUEST_HEADERS = {
+    "host", "content-length", "transfer-encoding", "connection", "te", "upgrade",
+    "expect", "cookie", "authorization", "proxy-authorization", "forwarded",
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
+}
+_ALLOWED_PROXY_METHODS = {"GET", "POST"}
+
+
+def _validate_proxy_url(url) -> "httpx.URL":
+    """대상 URL이 허용된 호스트(https)인지 엄격히 검사하고, 실제 요청에 쓸 httpx.URL을
+    돌려준다. 통과하지 못하면 400/403을 던진다.
+
+    검사는 "실제로 요청을 보내는 라이브러리(httpx)"가 해석한 결과를 기준으로 한다.
+    (예전에는 urllib로 검사하고 httpx로 요청해서, 두 라이브러리가 해석을 다르게 하는
+    특수한 URL이 있으면 검사를 통과하고 다른 곳으로 요청이 나갈 여지가 있었다.)
+      - https만 허용 (http면 실제 키가 암호화 없이 나간다)
+      - 주소에 '@', '\\', 공백/제어문자가 있으면 거부 (사용자정보·파서 혼동 속임수 차단)
+      - 포트 지정 거부 (기본 443만)
+      - 호스트가 _PROXY_HOST_RULES에 "정확히" 있어야 함
+      - urllib의 해석과 httpx의 해석이 서로 다르면 거부 (이중 확인)"""
+    if not isinstance(url, str) or not url or len(url) > 2000:
+        raise HTTPException(status_code=400, detail="url이 올바르지 않습니다.")
+    if "@" in url or "\\" in url or any(ord(c) < 33 or ord(c) == 127 for c in url):
+        raise HTTPException(status_code=403, detail="허용되지 않은 URL 형식입니다.")
+    try:
+        u = httpx.URL(url)
+    except Exception:
+        raise HTTPException(status_code=400, detail="url을 해석할 수 없습니다.")
+    if u.scheme != "https" or u.userinfo or u.port is not None:
+        raise HTTPException(status_code=403, detail="https 기본 포트의 주소만 허용됩니다.")
+    host = u.host or ""
+    if host not in _PROXY_HOST_RULES:
+        raise HTTPException(status_code=403, detail=f"허용되지 않은 대상 호스트입니다: {host}")
+    if (urllib.parse.urlparse(url).hostname or "") != host:
+        raise HTTPException(status_code=403, detail="URL 해석이 일치하지 않아 거부합니다.")
+    return u
+
+
 @app.post("/proxy")
 async def proxy(request: Request, authorization: str = Header(default="")):
     """geocode.py 등이 "이 URL로, 이 파라미터로 대신 호출해줘"라고 보내는
@@ -434,23 +549,32 @@ async def proxy(request: Request, authorization: str = Header(default="")):
     요청 본문(JSON): {"url": "...", "method": "GET", "params": {...}, "headers": {...}}
     url의 호스트가 _PROXY_HOST_RULES에 없으면 403으로 거부한다(이 서버가
     아무 주소나 대신 호출해주는 열린 중계기가 되는 것을 막기 위함)."""
-    agent_name = _authenticate(authorization)
+    agent_name = _authenticate(authorization, request)
+    _check_quota(agent_name, "proxy", _env_int("PROXY_DAILY_LIMIT", 5000))
 
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="요청 본문이 올바른 JSON이 아닙니다.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="요청 본문은 JSON 객체여야 합니다.")
 
-    url = body.get("url", "")
-    method = (body.get("method") or "GET").upper()
-    params = dict(body.get("params") or {})
-    headers = dict(body.get("headers") or {})
+    method = str(body.get("method") or "GET").upper()
+    if method not in _ALLOWED_PROXY_METHODS:
+        raise HTTPException(status_code=405, detail=f"허용되지 않은 메서드입니다: {method}")
+    raw_params = body.get("params") or {}
+    raw_headers = body.get("headers") or {}
+    if not isinstance(raw_params, dict) or not isinstance(raw_headers, dict):
+        raise HTTPException(status_code=400, detail="params/headers는 객체여야 합니다.")
+    params = dict(raw_params)
+    headers = {str(k): str(v) for k, v in raw_headers.items()
+               if str(k).lower() not in _BLOCKED_REQUEST_HEADERS}
     json_body = body.get("json")
 
-    host = urllib.parse.urlparse(url).hostname or ""
-    rule = _PROXY_HOST_RULES.get(host)
-    if not rule:
-        raise HTTPException(status_code=403, detail=f"허용되지 않은 대상 호스트입니다: {host}")
+    target = _validate_proxy_url(body.get("url", ""))
+    url = str(target)
+    host = target.host
+    rule = _PROXY_HOST_RULES[host]
 
     # ── VWorld 전용: 한국 리전 중계 서버로 위임 (설정돼 있으면) ─────────────────
     # api.vworld.kr이 해외 IP를 차단하는 것으로 보여, NCP_RELAY_URL이 설정돼
@@ -548,12 +672,36 @@ async def anthropic_messages(request: Request, x_api_key: str = Header(default="
     main.py가 스트리밍(stream=True)을 쓰지 않는다는 전제로 만들었다 - 나중에
     스트리밍을 쓰게 되면 이 함수도 응답을 스트리밍으로 그대로 중계하도록
     다시 손봐야 한다(지금은 응답을 한 번에 다 받은 뒤 통째로 돌려준다)."""
-    agent_name = _authenticate(x_api_key)
+    agent_name = _authenticate(x_api_key, request)
+    _check_quota(agent_name, "anthropic", _env_int("ANTHROPIC_DAILY_LIMIT", 500))
 
     body = await request.body()
     real_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not real_key:
         raise HTTPException(status_code=502, detail="서버에 ANTHROPIC_API_KEY가 설정되어 있지 않습니다.")
+
+    # ── 비용 보호: 모델/출력 길이 제한 ───────────────────────────────────────────
+    # 토큰만 있으면 exe 없이도 이 주소를 직접 호출할 수 있으므로, 서버가 "어떤 모델을
+    # 얼마나 길게" 쓸 수 있는지를 정해둔다.
+    try:
+        payload = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 본문이 올바른 JSON이 아닙니다.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="요청 본문은 JSON 객체여야 합니다.")
+
+    model = str(payload.get("model") or "")
+    allowed_models = [m.strip() for m in os.environ.get("ANTHROPIC_ALLOWED_MODELS", "").split(",") if m.strip()]
+    if allowed_models and model not in allowed_models:
+        print(f"[anthropic-proxy] 거부: 허용되지 않은 모델 agent={agent_name} model={model!r}", flush=True)
+        raise HTTPException(status_code=403, detail=f"허용되지 않은 모델입니다: {model}")
+
+    max_cap = _env_int("ANTHROPIC_MAX_TOKENS_CAP", 8192)
+    requested = payload.get("max_tokens")
+    if max_cap > 0 and isinstance(requested, (int, float)) and not isinstance(requested, bool) and requested > max_cap:
+        print(f"[anthropic-proxy] max_tokens {requested} -> {max_cap}로 낮춤 agent={agent_name}", flush=True)
+        payload["max_tokens"] = max_cap
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     forward_headers = {
         "x-api-key": real_key,
@@ -568,6 +716,6 @@ async def anthropic_messages(request: Request, x_api_key: str = Header(default="
         raise HTTPException(status_code=502, detail=f"Anthropic API 호출 실패: {e}")
 
     print(f"[anthropic-proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
-          f"status={resp.status_code}", flush=True)
+          f"model={model} status={resp.status_code}", flush=True)
     return Response(content=resp.content, status_code=resp.status_code,
                      media_type=resp.headers.get("content-type"))
