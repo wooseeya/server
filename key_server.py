@@ -73,6 +73,27 @@ X-Device-Id 헤더로 붙여 보낸다. agents.json의 해당 중개사 항목�
   ※ 한계: 기기 ID는 PC 값에서 계산한 해시일 뿐이라, 기술적으로 아는 사람이 토큰+기기 ID를
     둘 다 알아내 직접 요청을 만들면 우회할 수 있다. 일반 중개사 간 폴더 공유를 막는 용도다.
 
+★ v1.3 기기 "자동 등록" - 수동 등록이 번거로울 때 쓰는 선택 기능.
+agents.json 항목에 "max_devices": N을 쓰면, 그 토큰으로 처음 접속하는 PC를 서버가 N대까지
+자동으로 등록한다. 등록 기록은 agents.json이 아니라 별도 파일(devices.json)에 서버가
+GitHub Contents API로 직접 써서 남긴다 - 사람이 관리하는 agents.json은 서버가 절대
+수정하지 않는다(편집 충돌/토큰 유출 위험 방지).
+    "강남공인중개사": {"token": "9f3a...", "max_devices": 1}
+    "분당부동산":     {"token": "77b2...", "max_devices": 2, "devices": ["a1b2-c3d4-e5f6-7890"]}
+  - devices(수동 등록)와 max_devices를 같이 쓰면, 수동 등록분도 N대 안에 포함해서 센다.
+  - max_devices가 없고 devices만 있으면 v1.2 그대로 수동 등록 전용이다.
+  - 둘 다 없으면 제한 없음(DEVICE_BINDING_STRICT=1이면 전부 차단).
+  - devices.json 형식: {"중개사이름": [{"id": "...", "first_seen": "...", "ip": "..."}]}
+    PC를 바꿔야 하면 GitHub에서 해당 줄을 지우면 자리가 비워진다(최대 30초 후 반영).
+  - 필요한 환경변수(없으면 AGENTS_GITHUB_*를 대신 쓴다):
+      DEVICES_GITHUB_REPO / DEVICES_GITHUB_TOKEN / DEVICES_GITHUB_PATH(기본 devices.json)
+      / DEVICES_GITHUB_BRANCH(기본 main)
+    ★ 이 토큰은 Contents "Read and write" 권한이 필요하다. agents.json이 들어 있는 저장소에
+      쓰기 권한을 주면 토큰 유출 시 모든 중개사 토큰이 변조될 수 있으므로, devices.json 전용
+      별도 비공개 저장소 + 그 저장소 전용 토큰을 만들어 쓰기를 강하게 권장한다.
+  - 저장소가 설정 안 됐거나 GitHub 저장이 실패하면 "등록하지 않고" 503으로 거부한다(실패해도
+    무제한 등록되는 일이 없도록 안전한 쪽으로 닫는다). 이미 등록된 PC는 읽기 캐시로 계속 통과한다.
+
 ★ 왜 이렇게 바꿨는가: 처음 버전(v0.7 이하)은 /keys가 실제 키 값 자체를
 중개사 PC에 내려줬다. launcher.py가 그 값을 오프라인 대비용으로 로컬
 key.env/settings.json에 그대로 저장했는데, 그러면 "키 노출 없이 배포"라는
@@ -121,10 +142,12 @@ Render 대시보드의 Environment 탭 또는 아래 설명할 GitHub 저장소�
     curl -H "Authorization: Bearer test123" http://127.0.0.1:8000/keys
 """
 
+import base64
 import hmac
 import json
 import os
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -202,16 +225,16 @@ def _norm_device_id(value) -> str:
 
 
 def _normalize_entries(raw: dict) -> dict:
-    """AGENT_TOKENS/agents.json 원본(값이 토큰 문자열이거나 {"token","expires","devices"}
-    객체일 수 있음)을 공통 스키마 {"token": str, "expires": str|None, "devices": list|None}로
-    정리한다. 문자열 그대로 쓴 기존 항목은 expires=None(무기한), devices=None(기기 제한
-    없음)으로 취급해 하위호환된다. devices가 None이면 "제한 안 함", 리스트(빈 리스트
-    포함)면 "그 목록의 기기만 허용"이다."""
+    """AGENT_TOKENS/agents.json 원본(값이 토큰 문자열이거나 {"token","expires","devices",
+    "max_devices"} 객체일 수 있음)을 공통 스키마 {"token", "expires", "devices": list|None,
+    "max_devices": int|None}로 정리한다. 문자열 그대로 쓴 기존 항목은 expires=None(무기한),
+    devices=None, max_devices=None(기기 제한 없음)으로 취급해 하위호환된다.
+    devices가 리스트(빈 리스트 포함)면 수동 등록 목록, max_devices가 정수면 자동 등록 허용 대수."""
     out: dict = {}
     for name, entry in raw.items():
         if isinstance(entry, str):
             if entry:
-                out[str(name)] = {"token": entry, "expires": None, "devices": None}
+                out[str(name)] = {"token": entry, "expires": None, "devices": None, "max_devices": None}
         elif isinstance(entry, dict):
             token = str(entry.get("token") or "")
             if not token:
@@ -227,7 +250,19 @@ def _normalize_entries(raw: dict) -> dict:
                     # 형식이 이상하면 "제한 없음"으로 풀어주지 않고, 그 중개사만 차단(빈 목록)한다.
                     print(f"[AGENT_TOKENS] 경고: {name}의 devices 형식이 잘못됨 - 이 중개사는 차단됩니다.", flush=True)
                     devices = []
-            out[str(name)] = {"token": token, "expires": entry.get("expires") or None, "devices": devices}
+            max_devices = None
+            if "max_devices" in entry and entry["max_devices"] is not None:
+                try:
+                    max_devices = int(entry["max_devices"])
+                    if max_devices < 1 or isinstance(entry["max_devices"], bool):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    print(f"[AGENT_TOKENS] 경고: {name}의 max_devices가 1 이상의 정수가 아님 - 이 중개사는 차단됩니다.", flush=True)
+                    max_devices = None
+                    if devices is None:
+                        devices = []
+            out[str(name)] = {"token": token, "expires": entry.get("expires") or None,
+                              "devices": devices, "max_devices": max_devices}
     return out
 
 
@@ -357,25 +392,187 @@ def _request_device_id(request: Request | None) -> str:
     return _norm_device_id(request.headers.get("x-device-id", ""))
 
 
+# ── 자동 등록 저장소(devices.json, GitHub) ─────────────────────────────────────
+_DEV_CACHE_TTL_SEC = 30
+_dev_cache = {"data": {}, "sha": None, "fetched_at": 0.0, "last_error": None, "last_success_at": None}
+_dev_lock = threading.Lock()
+
+
+def _devices_store_conf():
+    """(repo, token, path, branch). DEVICES_GITHUB_*가 없으면 AGENTS_GITHUB_*를 대신 쓴다."""
+    def pick(*names, default=""):
+        for n in names:
+            v = os.environ.get(n, "").strip()
+            if v:
+                return v
+        return default
+    return (
+        pick("DEVICES_GITHUB_REPO", "AGENTS_GITHUB_REPO"),
+        pick("DEVICES_GITHUB_TOKEN", "AGENTS_GITHUB_TOKEN"),
+        pick("DEVICES_GITHUB_PATH", default="devices.json"),
+        pick("DEVICES_GITHUB_BRANCH", "AGENTS_GITHUB_BRANCH", default="main"),
+    )
+
+
+def _gh_contents(method: str, repo: str, token: str, path: str, branch: str, body: dict | None = None) -> dict:
+    url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}"
+    if method == "GET":
+        url += f"?ref={urllib.parse.quote(branch)}"
+    req = urllib.request.Request(
+        url, method=method,
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "listing-verify-key-server",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _normalize_device_store(raw) -> dict:
+    """devices.json -> {중개사이름: [{"id","first_seen","ip"}...]}. 사람이 손으로 문자열만
+    적어 넣은 항목도 받아들인다."""
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, items in raw.items():
+        if isinstance(items, (str, dict)):
+            items = [items]
+        if not isinstance(items, list):
+            continue
+        lst = []
+        for it in items:
+            if isinstance(it, dict):
+                did = _norm_device_id(it.get("id"))
+                if did:
+                    lst.append({**it, "id": did})
+            else:
+                did = _norm_device_id(it)
+                if did:
+                    lst.append({"id": did})
+        out[str(name)] = lst
+    return out
+
+
+def _load_devices(max_age: float = _DEV_CACHE_TTL_SEC) -> dict:
+    """devices.json을 읽는다(캐시 max_age초). 읽기에 실패하면 이전에 성공한 캐시가 있으면
+    그걸 쓰고(로그 남김), 한 번도 성공한 적이 없으면 예외를 던진다."""
+    now = time.time()
+    if now - _dev_cache["fetched_at"] <= max_age and _dev_cache["last_success_at"]:
+        return _dev_cache["data"]
+    repo, token, path, branch = _devices_store_conf()
+    if not repo or not token:
+        raise RuntimeError("DEVICES_GITHUB_REPO/TOKEN(또는 AGENTS_GITHUB_*)이 설정되어 있지 않습니다.")
+    try:
+        try:
+            res = _gh_contents("GET", repo, token, path, branch)
+            text = base64.b64decode(res["content"]).decode("utf-8")
+            data = _normalize_device_store(json.loads(text) if text.strip() else {})
+            sha = res.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            data, sha = {}, None   # 파일이 아직 없으면 빈 상태로 시작(처음 등록할 때 새로 만들어짐)
+        _dev_cache.update(data=data, sha=sha, fetched_at=now, last_error=None, last_success_at=now)
+        return data
+    except Exception as e:
+        _dev_cache["last_error"] = str(e)
+        print(f"[devices/GitHub] devices.json 조회 실패: {e}", flush=True)
+        if _dev_cache["last_success_at"]:
+            return _dev_cache["data"]
+        raise
+
+
+def _try_register_device(name: str, device: str, manual: list, max_devices: int,
+                         request: Request | None) -> str:
+    """자동 등록 시도. "ok"(이미 등록됐거나 방금 등록) | "full"(자리 없음)을 돌려주고,
+    저장소 문제면 예외를 던진다. 서버 한 대 안에서는 락으로 직렬화하고, 혹시 인스턴스가
+    여러 개여도 GitHub의 sha 충돌(409/422)이 나면 다시 읽어서 재시도하므로 초과 등록은 없다."""
+    def state(data):
+        ids = [x["id"] for x in data.get(name, [])]
+        total = set(ids) | set(manual)
+        return ids, total
+
+    with _dev_lock:
+        # 1) 캐시(최대 5초)로 먼저 판단 - 공격자가 요청을 반복해도 GitHub를 매번 두드리지 않게
+        ids, total = state(_load_devices(max_age=5))
+        if device in total:
+            return "ok"
+        if len(total) >= max_devices:
+            return "full"
+        # 2) 쓰기 직전에는 항상 최신 내용+sha로 다시 판단
+        repo, token, path, branch = _devices_store_conf()
+        for attempt in range(2):
+            data = _load_devices(max_age=0)
+            ids, total = state(data)
+            if device in total:
+                return "ok"
+            if len(total) >= max_devices:
+                return "full"
+            new_data = {k: list(v) for k, v in data.items()}
+            new_data.setdefault(name, []).append({
+                "id": device,
+                "first_seen": datetime.now(KST).isoformat(timespec="seconds"),
+                "ip": _client_ip(request),
+            })
+            body = {
+                "message": f"device auto-register: {name}",
+                "content": base64.b64encode(
+                    json.dumps(new_data, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
+                "branch": branch,
+            }
+            if _dev_cache["sha"]:
+                body["sha"] = _dev_cache["sha"]
+            try:
+                res = _gh_contents("PUT", repo, token, path, branch, body)
+            except urllib.error.HTTPError as e:
+                if e.code in (409, 422) and attempt == 0:
+                    _dev_cache["fetched_at"] = 0.0   # 그 사이 누가 고쳤다 -> 다시 읽고 재시도
+                    continue
+                raise
+            _dev_cache.update(data=new_data, sha=(res.get("content") or {}).get("sha"),
+                              fetched_at=time.time(), last_error=None, last_success_at=time.time())
+            print(f"[device-register] {datetime.now(timezone.utc).isoformat()} agent={name} "
+                  f"device={device} ip={_client_ip(request)} ({len(total) + 1}/{max_devices})", flush=True)
+            return "ok"
+    return "full"
+
+
 def _check_device(name: str, entry: dict, request: Request | None) -> None:
-    """이 중개사 항목에 devices 목록이 있으면(또는 DEVICE_BINDING_STRICT=1이면) 요청한
-    PC의 기기 ID가 그 목록에 있는지 확인하고, 아니면 403을 던진다. 목록이 없는 항목은
-    (STRICT가 꺼져 있으면) 통과시킨다."""
-    allowed = entry.get("devices")
-    if allowed is None:
+    """기기 확인. 수동 목록(devices) 또는 자동 등록 기록에 있는 PC만 통과시킨다.
+    max_devices가 있고 자리가 남아 있으면 처음 보는 PC를 자동 등록한다.
+    둘 다 없는 항목은(DEVICE_BINDING_STRICT=1이 아니면) 제한 없이 통과."""
+    manual = entry.get("devices")
+    max_devices = entry.get("max_devices")
+    if manual is None and max_devices is None:
         if os.environ.get("DEVICE_BINDING_STRICT", "").strip().lower() not in ("1", "true", "yes", "on"):
             return
-        allowed = []
+        manual = []
+    manual = manual or []
     device = _request_device_id(request)
-    if device and device in allowed:
+    if device and device in manual:
         return
+
     reason = "missing" if not device else "unregistered"
+    message = "등록되지 않은 PC입니다. 담당자에게 이 PC의 기기 ID 등록을 요청하세요."
+    if device and max_devices:
+        try:
+            result = _try_register_device(name, device, manual, max_devices, request)
+        except Exception as e:
+            # 저장소 문제: 등록하지 않고 닫는다(실패했는데 통과시키면 무제한 공유가 된다).
+            print(f"[device-fail] reason=store-error agent={name} device={device} error={e}", flush=True)
+            raise HTTPException(status_code=503, detail="기기 등록 저장소에 일시적인 문제가 있습니다. 잠시 후 다시 시도하세요.")
+        if result == "ok":
+            return
+        reason = "limit"
+        message = ("이 토큰에 허용된 PC 수를 이미 모두 사용 중입니다. 다른 PC에서 쓰려면 "
+                   "담당자에게 이 PC의 기기 ID를 전달해 변경을 요청하세요.")
     print(f"[device-fail] {datetime.now(timezone.utc).isoformat()} reason={reason} "
           f"agent={name} device={device or '-'} ip={_client_ip(request)}", flush=True)
-    raise HTTPException(status_code=403, detail={
-        "code": "device_not_registered",
-        "message": "등록되지 않은 PC입니다. 담당자에게 이 PC의 기기 ID 등록을 요청하세요.",
-    })
+    raise HTTPException(status_code=403, detail={"code": "device_not_registered", "message": message})
 
 
 def _find_entry_by_token(provided: str):
@@ -497,6 +694,10 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
         raise HTTPException(status_code=401, detail="Unauthorized")
     if refresh:
         _gh_cache["fetched_at"] = 0.0
+    try:
+        auto_store = _load_devices(max_age=0 if refresh else _DEV_CACHE_TTL_SEC)
+    except Exception:
+        auto_store = None   # 저장소 미설정/오류 - 아래 devices_store.last_error로 확인
     agents = sorted(_load_agent_tokens().items())  # _load_agent_tokens()를 먼저 호출해야
     # 위 refresh 처리로 리셋된 fetched_at을 보고 실제로 다시 조회를 시도하고,
     # 그 결과(성공/실패)가 last_error/last_success_at에 반영된 "다음"이다 -
@@ -504,13 +705,23 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
     return {
         "agents": [
             {"name": name, "expires": entry["expires"], "expired": _is_expired(entry["expires"]),
-             "device_bound": entry["devices"] is not None,
-             "device_count": len(entry["devices"]) if entry["devices"] is not None else None}
+             "device_bound": entry["devices"] is not None or entry["max_devices"] is not None,
+             "device_count": len(entry["devices"]) if entry["devices"] is not None else None,
+             "max_devices": entry["max_devices"],
+             "auto_registered": (len(auto_store.get(name, [])) if auto_store is not None else None)
+                                 if entry["max_devices"] else None}
             for name, entry in agents
         ],
         # GitHub agents.json 조회 자체가 잘 되고 있는지 - "만료일을 설정했는데도
         # 계속 통과된다"는 문의의 원인이 대부분 여기(조회가 조용히 계속 실패해서
         # 옛날 캐시를 쓰고 있음)였어서, 관리자가 바로 확인할 수 있게 노출한다.
+        "devices_store": {
+            "last_success_at": (
+                datetime.fromtimestamp(_dev_cache["last_success_at"], KST).isoformat()
+                if _dev_cache["last_success_at"] else None
+            ),
+            "last_error": _dev_cache["last_error"],
+        },
         "github_fetch": {
             "last_success_at": (
                 datetime.fromtimestamp(_gh_cache["last_success_at"], KST).isoformat()
