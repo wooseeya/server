@@ -467,13 +467,19 @@ def _diagnose_devices_store() -> str:
     repo, token, path, branch = _devices_store_conf()
     if not repo or not token:
         return "DEVICES_GITHUB_REPO/TOKEN 환경변수가 설정되어 있지 않음"
-    out = [f"설정: repo={repo} branch={branch} path={path}"]
+    def src(primary, fallback):
+        if os.environ.get(primary, "").strip():
+            return primary
+        return f"{fallback}(대체값 - {primary}가 비어 있거나 이름이 다름)"
+    out = [f"설정: repo={repo}[{src('DEVICES_GITHUB_REPO', 'AGENTS_GITHUB_REPO')}] branch={branch} path={path} "
+           f"token=[{src('DEVICES_GITHUB_TOKEN', 'AGENTS_GITHUB_TOKEN')}]"]
     try:
         info = _gh_raw("GET", f"https://api.github.com/repos/{repo}", token)
         out.append(f"저장소 접근 OK(private={info.get('private')}, 기본 브랜치={info.get('default_branch')})")
         perms = info.get("permissions")
         if isinstance(perms, dict):
-            out.append(f"push 권한={perms.get('push')}")
+            out.append(f"계정의 push 권한={perms.get('push')}(※ 토큰 자체의 쓰기 권한과는 별개 - "
+                       f"토큰의 Contents 권한은 실제 PUT 결과로만 알 수 있음)")
     except urllib.error.HTTPError as e:
         hint = {404: "저장소 이름 오타이거나, 토큰이 이 저장소에 접근할 수 없음(토큰의 Repository access 확인)",
                 401: "토큰이 잘못되었거나 만료됨"}.get(e.code, "")
@@ -625,6 +631,10 @@ def _check_device(name: str, entry: dict, request: Request | None) -> None:
             # 저장소 문제: 등록하지 않고 닫는다(실패했는데 통과시키면 무제한 공유가 된다).
             print(f"[device-fail] reason=store-error agent={name} device={device} "
                   f"error={getattr(e, 'gh_info', None) or e}", flush=True)
+            if "not accessible by personal access token" in str(getattr(e, "gh_info", "")):
+                print("[device-hint] 토큰에 쓰기 권한이 없습니다 - GitHub > Settings > Developer settings > "
+                      "Fine-grained tokens > 해당 토큰 > Repository permissions > Contents를 "
+                      "'Read and write'로 바꾸고 Update 하세요(토큰 값은 그대로).", flush=True)
             diag = _diagnose_devices_store()
             if diag:
                 print(f"[device-diagnose] {diag}", flush=True)
