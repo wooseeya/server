@@ -422,10 +422,7 @@ def _devices_store_conf():
     )
 
 
-def _gh_contents(method: str, repo: str, token: str, path: str, branch: str, body: dict | None = None) -> dict:
-    url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}"
-    if method == "GET":
-        url += f"?ref={urllib.parse.quote(branch)}"
+def _gh_raw(method: str, url: str, token: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(
         url, method=method,
         data=json.dumps(body).encode("utf-8") if body is not None else None,
@@ -438,6 +435,61 @@ def _gh_contents(method: str, repo: str, token: str, path: str, branch: str, bod
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _gh_contents(method: str, repo: str, token: str, path: str, branch: str, body: dict | None = None) -> dict:
+    url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}"
+    if method == "GET":
+        url += f"?ref={urllib.parse.quote(branch)}"
+    try:
+        return _gh_raw(method, url, token, body)
+    except urllib.error.HTTPError as e:
+        # 로그만 봐도 "어느 요청이(GET/PUT) 어떤 이유로" 실패했는지 알 수 있게 GitHub의 응답
+        # 메시지를 붙여 둔다(토큰은 포함하지 않음). 호출부는 기존처럼 e.code로 분기한다.
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("message", "")
+        except Exception:
+            msg = ""
+        e.gh_info = f"{method} {repo}/{path}@{branch} -> HTTP {e.code} {msg}".strip()
+        raise
+
+
+_diag_last = [0.0]
+
+
+def _diagnose_devices_store() -> str:
+    """기기 등록 저장소가 왜 실패하는지 한 번에 짚어주는 진단 문자열(1분에 한 번만 실행해
+    GitHub 호출이 쌓이지 않게 한다). 토큰 값은 절대 포함하지 않는다."""
+    now = time.time()
+    if now - _diag_last[0] < 60:
+        return ""
+    _diag_last[0] = now
+    repo, token, path, branch = _devices_store_conf()
+    if not repo or not token:
+        return "DEVICES_GITHUB_REPO/TOKEN 환경변수가 설정되어 있지 않음"
+    out = [f"설정: repo={repo} branch={branch} path={path}"]
+    try:
+        info = _gh_raw("GET", f"https://api.github.com/repos/{repo}", token)
+        out.append(f"저장소 접근 OK(private={info.get('private')}, 기본 브랜치={info.get('default_branch')})")
+        perms = info.get("permissions")
+        if isinstance(perms, dict):
+            out.append(f"push 권한={perms.get('push')}")
+    except urllib.error.HTTPError as e:
+        hint = {404: "저장소 이름 오타이거나, 토큰이 이 저장소에 접근할 수 없음(토큰의 Repository access 확인)",
+                401: "토큰이 잘못되었거나 만료됨"}.get(e.code, "")
+        out.append(f"저장소 조회 HTTP {e.code} - {hint}".rstrip(" -"))
+        return " | ".join(out)
+    except Exception as e:
+        out.append(f"저장소 조회 실패: {e}")
+        return " | ".join(out)
+    try:
+        _gh_raw("GET", f"https://api.github.com/repos/{repo}/branches/{urllib.parse.quote(branch)}", token)
+        out.append(f"브랜치 '{branch}' OK")
+    except urllib.error.HTTPError as e:
+        out.append(f"브랜치 '{branch}' 조회 HTTP {e.code} - 브랜치 이름이 다르거나(master 등) 저장소가 비어 있음")
+    except Exception as e:
+        out.append(f"브랜치 조회 실패: {e}")
+    return " | ".join(out)
 
 
 def _normalize_device_store(raw) -> dict:
@@ -487,8 +539,8 @@ def _load_devices(max_age: float = _DEV_CACHE_TTL_SEC) -> dict:
         _dev_cache.update(data=data, sha=sha, fetched_at=now, last_error=None, last_success_at=now)
         return data
     except Exception as e:
-        _dev_cache["last_error"] = str(e)
-        print(f"[devices/GitHub] devices.json 조회 실패: {e}", flush=True)
+        _dev_cache["last_error"] = getattr(e, "gh_info", None) or str(e)
+        print(f"[devices/GitHub] devices.json 조회 실패: {_dev_cache['last_error']}", flush=True)
         if _dev_cache["last_success_at"]:
             return _dev_cache["data"]
         raise
@@ -571,7 +623,11 @@ def _check_device(name: str, entry: dict, request: Request | None) -> None:
             result = _try_register_device(name, device, manual, max_devices, request)
         except Exception as e:
             # 저장소 문제: 등록하지 않고 닫는다(실패했는데 통과시키면 무제한 공유가 된다).
-            print(f"[device-fail] reason=store-error agent={name} device={device} error={e}", flush=True)
+            print(f"[device-fail] reason=store-error agent={name} device={device} "
+                  f"error={getattr(e, 'gh_info', None) or e}", flush=True)
+            diag = _diagnose_devices_store()
+            if diag:
+                print(f"[device-diagnose] {diag}", flush=True)
             raise HTTPException(status_code=503, detail="기기 등록 저장소에 일시적인 문제가 있습니다. 잠시 후 다시 시도하세요.")
         if result == "ok":
             return
