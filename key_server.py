@@ -94,6 +94,14 @@ GitHub Contents API로 직접 써서 남긴다 - 사람이 관리하는 agents.j
   - 저장소가 설정 안 됐거나 GitHub 저장이 실패하면 "등록하지 않고" 503으로 거부한다(실패해도
     무제한 등록되는 일이 없도록 안전한 쪽으로 닫는다). 이미 등록된 PC는 읽기 캐시로 계속 통과한다.
 
+★ v1.4 안전장치
+  - 같은 토큰이 여러 이름에 등록돼 있으면(예: 이름을 바꾸고 옛 항목을 안 지움) "가장 제한이
+    센 항목"(만료됨 > 기기 제한 있음 > 제한 없음)을 적용하고 로그에 경고한다. /agents의
+    duplicate_tokens에서도 겹치는 이름 묶음을 볼 수 있다.
+  - DISABLE_LEGACY_TOKEN=1: 레거시 공용 토큰(ACCESS_TOKEN)을 끈다(기기 제한을 우회하는 통로 차단).
+  - [device-seen] 로그: (중개사, 기기) 조합을 서버가 켜진 뒤 처음 볼 때 한 번 기록한다.
+  - GET뿐 아니라 HEAD /도 200으로 응답한다(모니터링 서비스의 405 로그 제거).
+
 ★ 왜 이렇게 바꿨는가: 처음 버전(v0.7 이하)은 /keys가 실제 키 값 자체를
 중개사 PC에 내려줬다. launcher.py가 그 값을 오프라인 대비용으로 로컬
 key.env/settings.json에 그대로 저장했는데, 그러면 "키 노출 없이 배포"라는
@@ -575,14 +583,67 @@ def _check_device(name: str, entry: dict, request: Request | None) -> None:
     raise HTTPException(status_code=403, detail={"code": "device_not_registered", "message": message})
 
 
+_dup_warned: set = set()
+_device_seen: set = set()
+
+
+def _entry_rank(entry: dict) -> int:
+    """같은 토큰이 여러 항목에 있을 때 어느 쪽을 적용할지 정하는 우선순위(작을수록 우선).
+    0 = 만료됨, 1 = 기기 제한 있음(devices/max_devices), 2 = 제한 없음.
+    "제한이 더 센 쪽"을 고르는 이유: 옛 항목이 (예: Render 환경변수 AGENT_TOKENS에) 남아
+    있어도 그 항목이 새로 건 기기 제한/만료를 조용히 무력화하지 못하게 하기 위함이다."""
+    if _is_expired(entry["expires"]):
+        return 0
+    if entry["devices"] is not None or entry["max_devices"] is not None:
+        return 1
+    return 2
+
+
 def _find_entry_by_token(provided: str):
-    """제공된 토큰 문자열과 일치하는 항목을 찾는다. (이름, {"token","expires"}) |
-    None(등록된 적 없는 토큰). 일치 여부와 상관없이 전체를 끝까지 비교한다."""
-    found = None
+    """제공된 토큰 문자열과 일치하는 항목을 찾는다. (이름, 항목) | None(등록된 적 없는 토큰).
+    일치 여부와 상관없이 전체를 끝까지 비교한다. 같은 토큰이 서로 다른 이름 2개 이상에
+    등록돼 있으면(이름만 바꾸고 옛 항목을 안 지운 경우 등) 가장 제한이 센 항목을 적용하고,
+    Render 로그에 어떤 이름들이 겹치는지 한 번 경고한다."""
+    matches = []
     for name, entry in _load_agent_tokens().items():
-        if _tokens_equal(provided, entry["token"]) and found is None:
-            found = (name, entry)
-    return found
+        if _tokens_equal(provided, entry["token"]):
+            matches.append((name, entry))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        names = tuple(sorted(n for n, _ in matches))
+        if names not in _dup_warned:
+            _dup_warned.add(names)
+            print(f"[AGENT_TOKENS] 경고: 같은 토큰이 여러 이름에 등록되어 있습니다: {', '.join(names)} "
+                  f"- 제한이 가장 센 항목을 적용합니다. 옛 항목을 삭제하세요"
+                  f"(Render 환경변수 AGENT_TOKENS와 GitHub agents.json 둘 다 확인).", flush=True)
+        matches.sort(key=lambda m: _entry_rank(m[1]))   # 안정 정렬: 동률이면 원래 순서 유지
+    return matches[0]
+
+
+def _legacy_token_enabled() -> bool:
+    """레거시 공용 토큰(ACCESS_TOKEN)을 받아줄지. DISABLE_LEGACY_TOKEN=1이면 끈다."""
+    return os.environ.get("DISABLE_LEGACY_TOKEN", "").strip().lower() not in ("1", "true", "yes", "on")
+
+
+def _note_device_seen(name: str, request: Request | None) -> None:
+    """(중개사, 기기) 조합을 서버가 켜진 뒤 처음 볼 때 한 번만 로그에 남긴다 - 제한이 없는
+    항목에서도 "이 토큰을 몇 대가 쓰는지" 로그로 볼 수 있게 한다(매 요청 기록은 너무 시끄럽다)."""
+    device = _request_device_id(request)
+    key = (name, device)
+    if key in _device_seen:
+        return
+    _device_seen.add(key)
+    print(f"[device-seen] {datetime.now(timezone.utc).isoformat()} agent={name} "
+          f"device={device or '-'} ip={_client_ip(request)}", flush=True)
+
+
+def _duplicate_token_groups(entries: dict) -> list:
+    """같은 토큰을 공유하는 이름 묶음 목록(토큰 값은 노출하지 않고 이름만)."""
+    by_token: dict = {}
+    for name, entry in entries.items():
+        by_token.setdefault(entry["token"], []).append(name)
+    return [sorted(names) for names in by_token.values() if len(names) > 1]
 
 
 def _authenticate(token_or_header: str, request: Request | None = None) -> str:
@@ -604,13 +665,14 @@ def _authenticate(token_or_header: str, request: Request | None = None) -> str:
                   f"agent={name} ip={_client_ip(request)}", flush=True)
             raise HTTPException(status_code=401, detail="토큰이 만료되었습니다. 담당자에게 갱신을 요청하세요.")
         _check_device(name, entry, request)   # v1.2: 등록된 PC에서 온 요청인지 확인
+        _note_device_seen(name, request)
         return name
 
     # 레거시 폴백: 예전 방식(중개사 구분 없는 단일 토큰)으로 이미 배포된 exe가
     # 있다면 ACCESS_TOKEN 환경변수를 지우기 전까지는 계속 동작한다. (만료 개념 없음)
     # ⚠ 이 토큰은 만료도, 중개사별 폐기도 안 된다 - 더 이상 쓰는 exe가 없으면 Render에서
     #   ACCESS_TOKEN 환경변수를 삭제할 것. 쓰이는 동안은 로그에 경고를 남긴다.
-    legacy_token = os.environ.get("ACCESS_TOKEN", "")
+    legacy_token = os.environ.get("ACCESS_TOKEN", "") if _legacy_token_enabled() else ""
     if legacy_token and _tokens_equal(provided, legacy_token):
         print(f"[auth] 경고: 레거시 공용 토큰으로 접근함 (만료/개별 폐기 불가) "
               f"ip={_client_ip(request)}", flush=True)
@@ -624,7 +686,7 @@ def _authenticate(token_or_header: str, request: Request | None = None) -> str:
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health():
     """Render 헬스체크 및 수동 확인용. 키/토큰은 절대 반환하지 않는다."""
     return {"ok": True, "service": "매물 검증 데스크 키 서버"}
@@ -672,7 +734,7 @@ async def token_info(request: Request, authorization: str = Header(default="")):
         days_left = (exp_date - datetime.now(KST).date()).days
         return {"agent": name, "expires": expires, "days_left": days_left, "expired": days_left < 0}
 
-    legacy_token = os.environ.get("ACCESS_TOKEN", "")
+    legacy_token = os.environ.get("ACCESS_TOKEN", "") if _legacy_token_enabled() else ""
     if legacy_token and _tokens_equal(provided, legacy_token):
         return {"agent": "(레거시 공용 토큰)", "expires": None, "days_left": None, "expired": False}
 
@@ -715,6 +777,8 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
         # GitHub agents.json 조회 자체가 잘 되고 있는지 - "만료일을 설정했는데도
         # 계속 통과된다"는 문의의 원인이 대부분 여기(조회가 조용히 계속 실패해서
         # 옛날 캐시를 쓰고 있음)였어서, 관리자가 바로 확인할 수 있게 노출한다.
+        "duplicate_tokens": _duplicate_token_groups(_load_agent_tokens()),
+        "legacy_token_enabled": bool(os.environ.get("ACCESS_TOKEN", "")) and _legacy_token_enabled(),
         "devices_store": {
             "last_success_at": (
                 datetime.fromtimestamp(_dev_cache["last_success_at"], KST).isoformat()
