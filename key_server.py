@@ -50,6 +50,29 @@ expires는 "YYYY-MM-DD" 형식이며, 그날 자정(UTC)이 지나면 만료로 
   ※ 횟수 제한은 서버 메모리에만 저장된다 - Render가 재시작/슬립되면 0으로 초기화된다.
     "절대 한도"가 필요하면 Anthropic 콘솔의 월 사용 한도를 반드시 함께 걸어둘 것.
 
+★ v1.2 기기(PC) 등록제 - 토큰 폴더를 통째로 복사해 다른 중개사에게 넘기는 것을 막는다.
+launcher.py가 PC 고유값(Windows MachineGuid)의 해시를 "기기 ID"로 만들어 모든 요청에
+X-Device-Id 헤더로 붙여 보낸다. agents.json의 해당 중개사 항목에 "devices" 목록이
+있으면, 이 목록에 있는 기기에서 온 요청만 통과시킨다(수동 등록 방식):
+    {
+      "강남공인중개사": {"token": "9f3a...", "expires": "2026-12-31",
+                         "devices": ["a1b2-c3d4-e5f6-7890", "1111-2222-3333-4444 사무실 2번 PC"]},
+      "분당부동산":     {"token": "77b2...", "devices": []},   // 아직 등록 전 = 전부 차단
+      "옛날중개사":     "5c9e..."                              // devices 키 없음 = 제한 없음(하위호환)
+    }
+  - "devices" 키가 "있으면"(빈 목록 [] 포함) 적용되고, "없으면" 제한하지 않는다.
+    새 중개사는 반드시 "devices": []로 만들어 두고 시작할 것(없이 만들면 등록 전까지 아무
+    PC나 쓸 수 있다). 항목 뒤에 공백으로 메모를 붙여도 된다(첫 단어만 ID로 인식).
+  - 기기 ID는 하이픈/대소문자를 무시하고 비교한다.
+  - 등록 절차: 중개사가 exe 실행 -> "등록되지 않은 PC" 안내창에 기기 ID가 뜨고 클립보드에
+    복사됨 -> 중개사가 그 ID를 전달 -> agents.json의 devices에 추가(최대 30초 후 반영).
+    같은 ID가 Render Logs의 [device-fail] 줄(reason=unregistered device=...)에도 남는다.
+  - 선택 환경변수 DEVICE_BINDING_STRICT=1: "devices" 키가 없는 항목(문자열 토큰 포함)도
+    전부 등록제로 취급한다(= devices가 []인 것과 동일). 모든 중개사를 등록제로 옮긴 뒤에 켤 것.
+  ※ 한계: 레거시 ACCESS_TOKEN(공용 토큰)은 기기 등록 대상이 아니다. 더 이상 안 쓰면 삭제할 것.
+  ※ 한계: 기기 ID는 PC 값에서 계산한 해시일 뿐이라, 기술적으로 아는 사람이 토큰+기기 ID를
+    둘 다 알아내 직접 요청을 만들면 우회할 수 있다. 일반 중개사 간 폴더 공유를 막는 용도다.
+
 ★ 왜 이렇게 바꿨는가: 처음 버전(v0.7 이하)은 /keys가 실제 키 값 자체를
 중개사 PC에 내려줬다. launcher.py가 그 값을 오프라인 대비용으로 로컬
 key.env/settings.json에 그대로 저장했는데, 그러면 "키 노출 없이 배포"라는
@@ -169,19 +192,42 @@ def _fetch_agent_tokens_from_github() -> dict:
     return {str(name): entry for name, entry in data.items() if entry}
 
 
+def _norm_device_id(value) -> str:
+    """기기 ID 정규화: 첫 단어만 취하고(뒤는 메모), 소문자+영숫자만 남긴다.
+    그래서 "A1B2-C3D4-E5F6-7890"과 "a1b2c3d4e5f67890"을 같은 값으로 비교한다."""
+    parts = str(value or "").strip().split()
+    if not parts:
+        return ""
+    return "".join(ch for ch in parts[0].lower() if ch.isalnum())[:64]
+
+
 def _normalize_entries(raw: dict) -> dict:
-    """AGENT_TOKENS/agents.json 원본(값이 토큰 문자열이거나 {"token","expires"}
-    객체일 수 있음)을 공통 스키마 {"token": str, "expires": str|None}로 정리한다.
-    문자열 그대로 쓴 기존 항목은 expires=None(무기한)으로 취급해 하위호환된다."""
+    """AGENT_TOKENS/agents.json 원본(값이 토큰 문자열이거나 {"token","expires","devices"}
+    객체일 수 있음)을 공통 스키마 {"token": str, "expires": str|None, "devices": list|None}로
+    정리한다. 문자열 그대로 쓴 기존 항목은 expires=None(무기한), devices=None(기기 제한
+    없음)으로 취급해 하위호환된다. devices가 None이면 "제한 안 함", 리스트(빈 리스트
+    포함)면 "그 목록의 기기만 허용"이다."""
     out: dict = {}
     for name, entry in raw.items():
         if isinstance(entry, str):
             if entry:
-                out[str(name)] = {"token": entry, "expires": None}
+                out[str(name)] = {"token": entry, "expires": None, "devices": None}
         elif isinstance(entry, dict):
             token = str(entry.get("token") or "")
-            if token:
-                out[str(name)] = {"token": token, "expires": entry.get("expires") or None}
+            if not token:
+                continue
+            devices = None
+            if "devices" in entry and entry["devices"] is not None:
+                d = entry["devices"]
+                if isinstance(d, (str, int)):
+                    d = [d]
+                if isinstance(d, list):
+                    devices = [x for x in (_norm_device_id(v) for v in d) if x]
+                else:
+                    # 형식이 이상하면 "제한 없음"으로 풀어주지 않고, 그 중개사만 차단(빈 목록)한다.
+                    print(f"[AGENT_TOKENS] 경고: {name}의 devices 형식이 잘못됨 - 이 중개사는 차단됩니다.", flush=True)
+                    devices = []
+            out[str(name)] = {"token": token, "expires": entry.get("expires") or None, "devices": devices}
     return out
 
 
@@ -304,6 +350,34 @@ def _check_quota(agent_name: str, bucket: str, limit: int) -> None:
     _usage[(agent_name, bucket)] = (day, count + 1)
 
 
+def _request_device_id(request: Request | None) -> str:
+    """요청 헤더 X-Device-Id를 정규화해서 돌려준다(없으면 빈 문자열)."""
+    if request is None:
+        return ""
+    return _norm_device_id(request.headers.get("x-device-id", ""))
+
+
+def _check_device(name: str, entry: dict, request: Request | None) -> None:
+    """이 중개사 항목에 devices 목록이 있으면(또는 DEVICE_BINDING_STRICT=1이면) 요청한
+    PC의 기기 ID가 그 목록에 있는지 확인하고, 아니면 403을 던진다. 목록이 없는 항목은
+    (STRICT가 꺼져 있으면) 통과시킨다."""
+    allowed = entry.get("devices")
+    if allowed is None:
+        if os.environ.get("DEVICE_BINDING_STRICT", "").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        allowed = []
+    device = _request_device_id(request)
+    if device and device in allowed:
+        return
+    reason = "missing" if not device else "unregistered"
+    print(f"[device-fail] {datetime.now(timezone.utc).isoformat()} reason={reason} "
+          f"agent={name} device={device or '-'} ip={_client_ip(request)}", flush=True)
+    raise HTTPException(status_code=403, detail={
+        "code": "device_not_registered",
+        "message": "등록되지 않은 PC입니다. 담당자에게 이 PC의 기기 ID 등록을 요청하세요.",
+    })
+
+
 def _find_entry_by_token(provided: str):
     """제공된 토큰 문자열과 일치하는 항목을 찾는다. (이름, {"token","expires"}) |
     None(등록된 적 없는 토큰). 일치 여부와 상관없이 전체를 끝까지 비교한다."""
@@ -332,6 +406,7 @@ def _authenticate(token_or_header: str, request: Request | None = None) -> str:
             print(f"[auth-fail] {datetime.now(timezone.utc).isoformat()} reason=expired "
                   f"agent={name} ip={_client_ip(request)}", flush=True)
             raise HTTPException(status_code=401, detail="토큰이 만료되었습니다. 담당자에게 갱신을 요청하세요.")
+        _check_device(name, entry, request)   # v1.2: 등록된 PC에서 온 요청인지 확인
         return name
 
     # 레거시 폴백: 예전 방식(중개사 구분 없는 단일 토큰)으로 이미 배포된 exe가
@@ -363,13 +438,14 @@ async def get_keys(request: Request, authorization: str = Header(default="")):
     agent_name = _authenticate(authorization, request)
     # Render 로그(대시보드 Logs 탭)에서 "누가 언제 키를 받아갔는지" 확인할 수
     # 있게 남겨둔다 - 이상 사용 감지(예: 새벽에 몰아서 대량 조회 등)에 도움된다.
-    print(f"[keys] {datetime.now(timezone.utc).isoformat()} agent={agent_name}", flush=True)
+    print(f"[keys] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
+          f"device={_request_device_id(request) or '-'} ip={_client_ip(request)}", flush=True)
     # ★ 공개해도 되는 값(PUBLIC_KEY_NAMES)만 돌려준다. 실제 서비스 키는 절대 내려주지 않는다.
     return {name: os.environ.get(name, "") for name in PUBLIC_KEY_NAMES}
 
 
 @app.get("/token-info")
-async def token_info(authorization: str = Header(default="")):
+async def token_info(request: Request, authorization: str = Header(default="")):
     """지금 쓰고 있는 토큰의 만료일/남은 일수를 알려준다. launcher.py가 실행할
     때마다 조용히 호출해서, 만료가 임박했거나 이미 지났으면 중개사 화면에 안내를
     띄우는 데 쓴다. /proxy, /v1/messages, /keys와 달리 이미 만료된 토큰이어도
@@ -388,6 +464,7 @@ async def token_info(authorization: str = Header(default="")):
     found = _find_entry_by_token(provided)
     if found:
         name, entry = found
+        _check_device(name, entry, request)   # v1.2: 만료된 토큰이어도 등록된 PC에서만 조회 허용
         expires = entry["expires"]
         if not expires:
             return {"agent": name, "expires": None, "days_left": None, "expired": False}
@@ -426,7 +503,9 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
     # 순서를 바꾸면 방금 시도한 조회 결과가 아니라 그 이전 상태를 보여주게 된다.
     return {
         "agents": [
-            {"name": name, "expires": entry["expires"], "expired": _is_expired(entry["expires"])}
+            {"name": name, "expires": entry["expires"], "expired": _is_expired(entry["expires"]),
+             "device_bound": entry["devices"] is not None,
+             "device_count": len(entry["devices"]) if entry["devices"] is not None else None}
             for name, entry in agents
         ],
         # GitHub agents.json 조회 자체가 잘 되고 있는지 - "만료일을 설정했는데도
