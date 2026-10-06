@@ -94,6 +94,14 @@ GitHub Contents API로 직접 써서 남긴다 - 사람이 관리하는 agents.j
   - 저장소가 설정 안 됐거나 GitHub 저장이 실패하면 "등록하지 않고" 503으로 거부한다(실패해도
     무제한 등록되는 일이 없도록 안전한 쪽으로 닫는다). 이미 등록된 PC는 읽기 캐시로 계속 통과한다.
 
+★ v1.5 기기 차단 목록
+    "동주부동산": {"token": "...", "max_devices": 2, "blocked_devices": ["134c-8d7f-03c9-df6d 퇴사자 PC"]}
+  - blocked_devices에 적은 기기는 수동 등록/자동 등록/허용 대수와 상관없이 항상 거부된다
+    (차단이 최우선). 차단한 기기는 허용 대수에서 빠지므로 그 자리가 비워진다.
+  - devices/max_devices 없이 blocked_devices만 있어도 된다(그 기기만 막고 나머지는 제한 없음).
+  - 차단을 풀려면 목록에서 지운다(devices.json에 남아 있던 기록이 있으면 다시 통과한다).
+  - 형식은 devices와 같다(하이픈/대소문자 무시, 뒤에 공백+메모 가능).
+
 ★ v1.4 안전장치
   - 같은 토큰이 여러 이름에 등록돼 있으면(예: 이름을 바꾸고 옛 항목을 안 지움) "가장 제한이
     센 항목"(만료됨 > 기기 제한 있음 > 제한 없음)을 적용하고 로그에 경고한다. /agents의
@@ -242,7 +250,7 @@ def _normalize_entries(raw: dict) -> dict:
     for name, entry in raw.items():
         if isinstance(entry, str):
             if entry:
-                out[str(name)] = {"token": entry, "expires": None, "devices": None, "max_devices": None}
+                out[str(name)] = {"token": entry, "expires": None, "devices": None, "max_devices": None, "blocked_devices": []}
         elif isinstance(entry, dict):
             token = str(entry.get("token") or "")
             if not token:
@@ -258,6 +266,15 @@ def _normalize_entries(raw: dict) -> dict:
                     # 형식이 이상하면 "제한 없음"으로 풀어주지 않고, 그 중개사만 차단(빈 목록)한다.
                     print(f"[AGENT_TOKENS] 경고: {name}의 devices 형식이 잘못됨 - 이 중개사는 차단됩니다.", flush=True)
                     devices = []
+            blocked = []
+            if "blocked_devices" in entry and entry["blocked_devices"] is not None:
+                bd = entry["blocked_devices"]
+                if isinstance(bd, (str, int)):
+                    bd = [bd]
+                if isinstance(bd, list):
+                    blocked = [x for x in (_norm_device_id(v) for v in bd) if x]
+                else:
+                    print(f"[AGENT_TOKENS] 경고: {name}의 blocked_devices 형식이 잘못되어 무시됩니다(차단이 적용되지 않음).", flush=True)
             max_devices = None
             if "max_devices" in entry and entry["max_devices"] is not None:
                 try:
@@ -270,7 +287,7 @@ def _normalize_entries(raw: dict) -> dict:
                     if devices is None:
                         devices = []
             out[str(name)] = {"token": token, "expires": entry.get("expires") or None,
-                              "devices": devices, "max_devices": max_devices}
+                              "devices": devices, "max_devices": max_devices, "blocked_devices": blocked}
     return out
 
 
@@ -553,13 +570,16 @@ def _load_devices(max_age: float = _DEV_CACHE_TTL_SEC) -> dict:
 
 
 def _try_register_device(name: str, device: str, manual: list, max_devices: int,
-                         request: Request | None) -> str:
+                         request: Request | None, blocked: list | None = None) -> str:
     """자동 등록 시도. "ok"(이미 등록됐거나 방금 등록) | "full"(자리 없음)을 돌려주고,
     저장소 문제면 예외를 던진다. 서버 한 대 안에서는 락으로 직렬화하고, 혹시 인스턴스가
     여러 개여도 GitHub의 sha 충돌(409/422)이 나면 다시 읽어서 재시도하므로 초과 등록은 없다."""
+    blocked_set = set(blocked or [])
+
     def state(data):
-        ids = [x["id"] for x in data.get(name, [])]
-        total = set(ids) | set(manual)
+        # 차단된 기기는 자리를 차지하지 않는 것으로 센다(차단하면 그 자리가 비워진다).
+        ids = [x["id"] for x in data.get(name, []) if x["id"] not in blocked_set]
+        total = (set(ids) | set(manual)) - blocked_set
         return ids, total
 
     with _dev_lock:
@@ -611,14 +631,23 @@ def _check_device(name: str, entry: dict, request: Request | None) -> None:
     """기기 확인. 수동 목록(devices) 또는 자동 등록 기록에 있는 PC만 통과시킨다.
     max_devices가 있고 자리가 남아 있으면 처음 보는 PC를 자동 등록한다.
     둘 다 없는 항목은(DEVICE_BINDING_STRICT=1이 아니면) 제한 없이 통과."""
+    blocked = entry.get("blocked_devices") or []
+    device = _request_device_id(request)
+    if device and device in blocked:
+        # 차단 목록이 최우선이다 - 수동 등록 목록/자동 등록 기록/허용 대수와 상관없이 무조건 거부.
+        print(f"[device-fail] {datetime.now(timezone.utc).isoformat()} reason=blocked "
+              f"agent={name} device={device} ip={_client_ip(request)}", flush=True)
+        raise HTTPException(status_code=403, detail={
+            "code": "device_not_registered",
+            "message": "이 PC는 사용이 차단되었습니다. 담당자에게 문의하세요.",
+        })
     manual = entry.get("devices")
     max_devices = entry.get("max_devices")
     if manual is None and max_devices is None:
         if os.environ.get("DEVICE_BINDING_STRICT", "").strip().lower() not in ("1", "true", "yes", "on"):
             return
         manual = []
-    manual = manual or []
-    device = _request_device_id(request)
+    manual = [d for d in (manual or []) if d not in blocked]
     if device and device in manual:
         return
 
@@ -626,7 +655,7 @@ def _check_device(name: str, entry: dict, request: Request | None) -> None:
     message = "등록되지 않은 PC입니다. 담당자에게 이 PC의 기기 ID 등록을 요청하세요."
     if device and max_devices:
         try:
-            result = _try_register_device(name, device, manual, max_devices, request)
+            result = _try_register_device(name, device, manual, max_devices, request, blocked)
         except Exception as e:
             # 저장소 문제: 등록하지 않고 닫는다(실패했는데 통과시키면 무제한 공유가 된다).
             print(f"[device-fail] reason=store-error agent={name} device={device} "
@@ -836,6 +865,7 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
              "device_bound": entry["devices"] is not None or entry["max_devices"] is not None,
              "device_count": len(entry["devices"]) if entry["devices"] is not None else None,
              "max_devices": entry["max_devices"],
+             "blocked_count": len(entry["blocked_devices"]),
              "auto_registered": (len(auto_store.get(name, [])) if auto_store is not None else None)
                                  if entry["max_devices"] else None}
             for name, entry in agents
