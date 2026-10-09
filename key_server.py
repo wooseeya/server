@@ -899,6 +899,16 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
 
 _PROXY_TIMEOUT_SEC = 20.0
 
+# VWorld 중계 호출(Render -> 네이버클라우드 VM) 전용 타임아웃. ⚠ [2026-10 타임아웃
+# 구조 수정] PC -> Render -> 네이버클라우드VM -> VWorld로 이어지는 3단 중첩
+# 구조에서, 이 구간이 안쪽(네이버VM -> VWorld, vworld_relay.py의 15초)을 통째로
+# 포함해야 하므로 _PROXY_TIMEOUT_SEC(다른 호스트용, 중첩 없는 단일 홉 기준값)보다
+# 반드시 더 길어야 한다. 예전엔 둘 다 20초로 같아서, 네이버VM 쪽이 15~19초 가까이
+# 쓰면 이 구간도 거의 그만큼 걸리는데 그러면 PC 쪽(land_ledger.py, 40초)과는
+# 여유가 있어도 "내부 두 구간이 사실상 같은 예산"이라 네트워크 왕복시간만 더해도
+# 아슬아슬하게 타임아웃이 날 수 있었다.
+_RELAY_TIMEOUT_SEC = 25.0
+
 # api.vworld.kr은 (2026-09 확인) 최신 Linux(OpenSSL 3.x) 환경의 기본 보안수준
 # (SECLEVEL=2)에서 거부되는 구형 TLS 암호(SEED 계열 등)로만 응답하려는 것으로
 # 보인다 - 그 결과 TLS 핸드셰이크 단계에서 그대로 연결이 끊겨 httpx가
@@ -1039,7 +1049,7 @@ async def proxy(request: Request, authorization: str = Header(default="")):
         relay_token = os.environ.get("NCP_RELAY_TOKEN", "")
         if relay_url:
             try:
-                async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC) as client:
+                async with httpx.AsyncClient(timeout=_RELAY_TIMEOUT_SEC) as client:
                     resp = await client.post(
                         f"{relay_url.rstrip('/')}/relay",
                         json={"url": url, "method": method, "params": params, "headers": headers},
