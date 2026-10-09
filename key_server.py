@@ -24,6 +24,8 @@ FastAPI 앱이다. 하는 일은 다섯 가지다:
                            launcher.py가 "언제까지였는지"를 사용자에게 보여줄
                            수 있다. /proxy, /v1/messages, /keys는 만료된 토큰을
                            그대로 거부한다(v0.11부터).
+  - GET  /diagnose       : 관리자 토큰(ADMIN_TOKEN)으로 Render -> 카카오 / 건축HUB(data.go.kr) / NCP 중계 ->
+                           VWorld 연결을 한 번에 시험하고, 어디가 안 되는지 알려준다(키 값은 노출 안 함).
   - GET  /agents         : 관리자 토큰(ADMIN_TOKEN)으로만 등록된 중개사 이름/
                            만료일 목록을 보여준다(토큰 값 자체는 절대 안 보여줌).
 
@@ -158,6 +160,7 @@ Render 대시보드의 Environment 탭 또는 아래 설명할 GitHub 저장소�
     curl -H "Authorization: Bearer test123" http://127.0.0.1:8000/keys
 """
 
+import asyncio
 import base64
 import hmac
 import json
@@ -168,6 +171,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
 KST = timezone(timedelta(hours=9))  # 만료일(expires) 판정은 한국 시간 기준으로 한다 -
@@ -897,28 +901,7 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
 # 이 엔드포인트를 통해 카카오/공공데이터/VWorld를 "대신" 호출하게 한다.
 # ---------------------------------------------------------------------------
 
-def _net_error_detail(e: Exception) -> str:
-    """httpx.ConnectTimeout/ConnectError/ReadTimeout 등 "연결 단계" 예외는 str(e)가
-    아무 이유 텍스트 없이 빈 문자열로 오는 경우가 실제로 흔하다 - 그러면 이 함수를
-    거치지 않은 f"...실패: {e}" 메시지가 콜론 뒤에 아무것도 없이 끝나버려서, 이
-    Render 응답을 받는 PC 쪽(land_ledger.py 등)도 진짜 원인(타임아웃/연결거부/DNS
-    실패)을 전혀 알 수 없게 된다(2026-10, 실제로 "한국 중계 서버(NCP_RELAY_URL)
-    호출 실패: "가 콜론에서 끊긴 채로 재현됨). 최소한 예외 타입명이라도 보이게 한다."""
-    text = str(e).strip()
-    return text if text else f"{type(e).__name__} (빈 오류 메시지 - 보통 타임아웃/연결 실패/DNS 문제)"
-
-
 _PROXY_TIMEOUT_SEC = 20.0
-
-# VWorld 중계 호출(Render -> 네이버클라우드 VM) 전용 타임아웃. ⚠ [2026-10 타임아웃
-# 구조 수정] PC -> Render -> 네이버클라우드VM -> VWorld로 이어지는 3단 중첩
-# 구조에서, 이 구간이 안쪽(네이버VM -> VWorld, vworld_relay.py의 15초)을 통째로
-# 포함해야 하므로 _PROXY_TIMEOUT_SEC(다른 호스트용, 중첩 없는 단일 홉 기준값)보다
-# 반드시 더 길어야 한다. 예전엔 둘 다 20초로 같아서, 네이버VM 쪽이 15~19초 가까이
-# 쓰면 이 구간도 거의 그만큼 걸리는데 그러면 PC 쪽(land_ledger.py, 40초)과는
-# 여유가 있어도 "내부 두 구간이 사실상 같은 예산"이라 네트워크 왕복시간만 더해도
-# 아슬아슬하게 타임아웃이 날 수 있었다.
-_RELAY_TIMEOUT_SEC = 25.0
 
 # api.vworld.kr은 (2026-09 확인) 최신 Linux(OpenSSL 3.x) 환경의 기본 보안수준
 # (SECLEVEL=2)에서 거부되는 구형 TLS 암호(SEED 계열 등)로만 응답하려는 것으로
@@ -1012,6 +995,170 @@ def _validate_proxy_url(url) -> "httpx.URL":
     return u
 
 
+# ---------------------------------------------------------------------------
+# /diagnose - 관리자 전용 연결 점검
+# ---------------------------------------------------------------------------
+# "로컬에서는 되는데 배포 버전에서는 지번 조회/매물유형 자동감지가 안 된다"처럼, 어느 구간
+# (Render -> 카카오 / 건축HUB(data.go.kr) / NCP 중계 -> VWorld)이 막혔는지 모를 때 쓴다.
+# 실제 서비스와 같은 키·같은 경로로 가볍게 한 번씩 호출해서 구간별로 정상/문제를 알려준다.
+# 응답에는 키 값이 절대 들어가지 않고(환경변수 값은 있음/없음만 표시), 오류 문구에 섞여 들어갈
+# 수 있는 키는 *** 로 가린다.
+
+_DIAG_ADDR = "서울 강남구 역삼동 736-1"          # 시험용 지번(결과가 있든 없든 "연결/인증"만 본다)
+_DIAG_PNU = "1168010100107360001"               # 위 지번의 PNU(시군구 11680 + 역삼동 10100 + 대지 1 + 0736-0001)
+_DIAG_GATEWAY_HINTS = {
+    "20": "접근 거부 - 이 키로 '건축HUB 건축물대장정보' 활용신청이 승인됐는지 확인",
+    "22": "일일 호출 한도 초과 - 내일 다시 시도하거나 공공데이터포털에서 트래픽 증설 신청",
+    "30": "등록되지 않은 서비스키 - Render의 DATA_SERVICE_KEY 값(복사 오류, Encoding/Decoding 혼동)과 활용신청 승인 여부 확인",
+    "31": "서비스키 활용기간 만료 - 공공데이터포털에서 연장",
+    "32": "등록되지 않은 IP",
+}
+
+
+def _mask_secrets(text) -> str:
+    out = str(text)
+    for name in ("KAKAO_KEY", "DATA_SERVICE_KEY", "VWORLD_KEY", "NCP_RELAY_TOKEN", "ADMIN_TOKEN", "ANTHROPIC_API_KEY"):
+        v = os.environ.get(name, "")
+        if len(v) >= 6:
+            out = out.replace(v, "***").replace(urllib.parse.quote(v, safe=""), "***")
+    return out
+
+
+def _snip(text, n: int = 160) -> str:
+    return _mask_secrets(" ".join(str(text or "").split())[:n])
+
+
+def _diag_result(ok: bool, started: float, detail: str, hint: str = "") -> dict:
+    return {"ok": ok, "ms": int((time.monotonic() - started) * 1000), "detail": detail, "hint": hint}
+
+
+async def _diag_kakao(client) -> dict:
+    started = time.monotonic()
+    key = os.environ.get("KAKAO_KEY", "")
+    if not key:
+        return _diag_result(False, started, "Render에 KAKAO_KEY가 설정되어 있지 않음", "Render Environment에 KAKAO_KEY 추가")
+    try:
+        r = await client.get("https://dapi.kakao.com/v2/local/search/address.json",
+                             params={"query": _DIAG_ADDR, "size": 1},
+                             headers={"Authorization": f"KakaoAK {key}"})
+    except Exception as e:
+        return _diag_result(False, started, f"연결 실패: {type(e).__name__}: {_snip(e)}", "Render에서 카카오 서버로 나가는 연결 문제")
+    if r.status_code == 200:
+        try:
+            n = len(r.json().get("documents", []))
+        except Exception:
+            return _diag_result(False, started, f"HTTP 200이지만 JSON이 아님: {_snip(r.text)}")
+        return _diag_result(True, started, f"HTTP 200, 주소 검색 결과 {n}건")
+    hint = {401: "KAKAO_KEY가 잘못됨(REST API 키인지 확인)", 403: "카카오 앱에서 로컬 API 사용 설정/권한 확인"}.get(r.status_code, "")
+    return _diag_result(False, started, f"HTTP {r.status_code}: {_snip(r.text)}", hint)
+
+
+async def _diag_building(client) -> dict:
+    started = time.monotonic()
+    key = os.environ.get("DATA_SERVICE_KEY", "")
+    if not key:
+        return _diag_result(False, started, "Render에 DATA_SERVICE_KEY가 설정되어 있지 않음", "Render Environment에 DATA_SERVICE_KEY 추가")
+    params = {"serviceKey": key, "sigunguCd": "11680", "bjdongCd": "10100", "platGbCd": "0",
+              "bun": "0736", "ji": "0001", "numOfRows": "1", "pageNo": "1"}
+    try:
+        r = await client.get("https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo", params=params)
+    except Exception as e:
+        return _diag_result(False, started, f"연결 실패: {type(e).__name__}: {_snip(e)}", "Render에서 공공데이터포털로 나가는 연결 문제")
+    text = (r.text or "").strip()
+    if r.status_code != 200:
+        return _diag_result(False, started, f"HTTP {r.status_code}: {_snip(text)}",
+                            "401이면 서비스키 오류(키 값/Encoding·Decoding/활용신청 승인) 가능성이 큼")
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return _diag_result(False, started, f"XML이 아닌 응답: {_snip(text)}")
+    hdr = root.find(".//cmmMsgHeader")
+    if hdr is not None or root.tag == "OpenAPI_ServiceResponse":
+        node = hdr if hdr is not None else root
+        code = (node.findtext("returnReasonCode") or "").strip().lstrip("0")
+        reason = (node.findtext("returnAuthMsg") or node.findtext("errMsg") or "").strip()
+        return _diag_result(False, started, f"공공데이터포털 게이트웨이 오류(code={code or '?'}, {reason})", _DIAG_GATEWAY_HINTS.get(code, ""))
+    result_code = (root.findtext(".//resultCode") or "").strip()
+    if result_code in ("00", "0", "000", "0000"):
+        return _diag_result(True, started, f"정상(resultCode={result_code}, 전체 {(root.findtext('.//totalCount') or '0').strip()}건)")
+    return _diag_result(False, started, f"건축HUB 오류(resultCode={result_code}): {_snip(root.findtext('.//resultMsg') or text)}")
+
+
+async def _diag_vworld(client) -> dict:
+    """VWorld 구간. NCP_RELAY_URL이 있으면 서비스와 똑같이 한국 중계 서버를 거치고, 없으면 Render가 직접 호출한다."""
+    started = time.monotonic()
+    land_url = "https://api.vworld.kr/ned/data/getLandCharacteristics"
+    land_params = {"format": "xml", "numOfRows": "1", "pageNo": "1", "pnu": _DIAG_PNU,
+                   "stdrYear": str(datetime.now(KST).year - 1)}
+    relay_url = os.environ.get("NCP_RELAY_URL", "").strip()
+    steps = {}
+    try:
+        if relay_url:
+            base = relay_url.rstrip("/")
+            try:   # 1) 중계 서버가 살아 있는지(어떤 HTTP 응답이든 오면 "도달 가능")
+                pr = await client.get(base + "/")
+                steps["중계서버_도달"] = f"가능(HTTP {pr.status_code})"
+            except Exception as e:
+                return {**_diag_result(False, started, f"NCP 중계 서버에 연결할 수 없음: {type(e).__name__}: {_snip(e)}",
+                                       "NCP 서버가 꺼졌거나 NCP_RELAY_URL 주소/포트/방화벽(ACG) 문제"), "steps": steps}
+            # 2) 서비스와 같은 방식(Render -> 중계 -> VWorld)으로 실제 호출
+            r = await client.post(base + "/relay",
+                                  json={"url": land_url, "method": "GET",
+                                        "params": {**land_params, "key": "", "domain": "localhost"}, "headers": {}},
+                                  headers={"Authorization": f"Bearer {os.environ.get('NCP_RELAY_TOKEN', '')}"})
+            via = "NCP 중계"
+        else:
+            vkey, vdom = os.environ.get("VWORLD_KEY", ""), os.environ.get("VWORLD_DOMAIN", "")
+            if not (vkey and vdom):
+                return _diag_result(False, started, "NCP_RELAY_URL도 없고 VWORLD_KEY/VWORLD_DOMAIN도 Render에 없음", "둘 중 한 방식을 설정")
+            async with httpx.AsyncClient(timeout=15.0, verify=_ssl_context_for_host(_VWORLD_HOST) or True) as direct:
+                r = await direct.get(land_url, params={**land_params, "key": vkey, "domain": vdom})
+            via = "Render 직접 호출"
+    except Exception as e:
+        return {**_diag_result(False, started, f"호출 실패: {type(e).__name__}: {_snip(e)}", "시간 초과면 중계 서버/VWorld 응답 지연"), "steps": steps}
+
+    body = (r.text or "")
+    if r.status_code != 200:
+        hint = {401: "NCP_RELAY_TOKEN 불일치 가능", 403: "NCP_RELAY_TOKEN 불일치 또는 VWorld 접근 거부(해외 IP/도메인 등록)",
+                404: "중계 서버에 /relay 경로가 없음(vworld_relay.py 버전 확인)", 502: "중계 서버가 VWorld 호출에 실패"}.get(r.status_code, "")
+        return {**_diag_result(False, started, f"[{via}] HTTP {r.status_code}: {_snip(body)}", hint), "steps": steps}
+    low = body.lower()
+    if any(m in low for m in ("<error", "invalid_key", "incorrect", "인증", "등록되지", "status>error")):
+        return {**_diag_result(False, started, f"[{via}] HTTP 200이지만 VWorld 오류 응답: {_snip(body)}",
+                               "VWorld 키/도메인 등록(VWorld 콘솔)과 중계 서버의 VWORLD_KEY·VWORLD_DOMAIN 확인"), "steps": steps}
+    found = "<field" in low
+    return {**_diag_result(True, started, f"[{via}] 정상 응답({'결과 있음' if found else '결과 0건 - 연결/인증은 정상'})"), "steps": steps}
+
+
+@app.get("/diagnose")
+async def diagnose(authorization: str = Header(default="")):
+    """관리자 전용. 카카오 / 건축HUB(data.go.kr) / VWorld(NCP 중계 포함) 연결을 한 번에 시험한다."""
+    admin_token = os.environ.get("ADMIN_TOKEN", "")
+    provided = authorization[7:] if authorization.startswith("Bearer ") else ""
+    if not admin_token or not _tokens_equal(provided, admin_token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        kakao, building, vworld = await asyncio.gather(
+            _diag_kakao(client), _diag_building(client), _diag_vworld(client))
+    names = {"kakao": "카카오(주소검색)", "building_hub": "건축HUB(data.go.kr)", "vworld": "VWorld(NCP 중계 포함)"}
+    checks = {"kakao": kakao, "building_hub": building, "vworld": vworld}
+    failing = [names[k] for k, v in checks.items() if not v["ok"]]
+    env_present = {n: bool(os.environ.get(n, "").strip()) for n in
+                   ("KAKAO_KEY", "DATA_SERVICE_KEY", "VWORLD_KEY", "VWORLD_DOMAIN", "NCP_RELAY_URL", "NCP_RELAY_TOKEN", "ANTHROPIC_API_KEY")}
+    return {
+        "summary": "모든 구간 정상" if not failing else "문제 있음: " + ", ".join(failing),
+        "checks": checks,
+        "env_present": env_present,
+        "agents_github": {
+            "last_success_at": (datetime.fromtimestamp(_gh_cache["last_success_at"], KST).isoformat()
+                                if _gh_cache.get("last_success_at") else None),
+            "last_error": _mask_secrets(_gh_cache.get("last_error") or "") or None,
+        },
+        "note": "시험 지번은 서울 강남구 역삼동 736-1이며, 결과가 0건이어도 연결·인증이 정상이면 '정상'으로 표시합니다.",
+    }
+
+
 @app.post("/proxy")
 async def proxy(request: Request, authorization: str = Header(default="")):
     """geocode.py 등이 "이 URL로, 이 파라미터로 대신 호출해줘"라고 보내는
@@ -1060,14 +1207,14 @@ async def proxy(request: Request, authorization: str = Header(default="")):
         relay_token = os.environ.get("NCP_RELAY_TOKEN", "")
         if relay_url:
             try:
-                async with httpx.AsyncClient(timeout=_RELAY_TIMEOUT_SEC) as client:
+                async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC) as client:
                     resp = await client.post(
                         f"{relay_url.rstrip('/')}/relay",
                         json={"url": url, "method": method, "params": params, "headers": headers},
                         headers={"Authorization": f"Bearer {relay_token}"},
                     )
             except httpx.HTTPError as e:
-                raise HTTPException(status_code=502, detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {_net_error_detail(e)}")
+                raise HTTPException(status_code=502, detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {e}")
 
             print(f"[proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
                   f"host={host} via=relay status={resp.status_code}", flush=True)
@@ -1114,7 +1261,7 @@ async def proxy(request: Request, authorization: str = Header(default="")):
         async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC, verify=verify_option) as client:
             resp = await client.request(method, url, params=params, headers=headers, json=json_body)
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"대상 API 호출 실패: {_net_error_detail(e)}")
+        raise HTTPException(status_code=502, detail=f"대상 API 호출 실패: {e}")
 
     print(f"[proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
           f"host={host} status={resp.status_code}", flush=True)
