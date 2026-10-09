@@ -897,6 +897,17 @@ async def list_agents(authorization: str = Header(default=""), refresh: bool = F
 # 이 엔드포인트를 통해 카카오/공공데이터/VWorld를 "대신" 호출하게 한다.
 # ---------------------------------------------------------------------------
 
+def _net_error_detail(e: Exception) -> str:
+    """httpx.ConnectTimeout/ConnectError/ReadTimeout 등 "연결 단계" 예외는 str(e)가
+    아무 이유 텍스트 없이 빈 문자열로 오는 경우가 실제로 흔하다 - 그러면 이 함수를
+    거치지 않은 f"...실패: {e}" 메시지가 콜론 뒤에 아무것도 없이 끝나버려서, 이
+    Render 응답을 받는 PC 쪽(land_ledger.py 등)도 진짜 원인(타임아웃/연결거부/DNS
+    실패)을 전혀 알 수 없게 된다(2026-10, 실제로 "한국 중계 서버(NCP_RELAY_URL)
+    호출 실패: "가 콜론에서 끊긴 채로 재현됨). 최소한 예외 타입명이라도 보이게 한다."""
+    text = str(e).strip()
+    return text if text else f"{type(e).__name__} (빈 오류 메시지 - 보통 타임아웃/연결 실패/DNS 문제)"
+
+
 _PROXY_TIMEOUT_SEC = 20.0
 
 # VWorld 중계 호출(Render -> 네이버클라우드 VM) 전용 타임아웃. ⚠ [2026-10 타임아웃
@@ -1056,12 +1067,7 @@ async def proxy(request: Request, authorization: str = Header(default="")):
                         headers={"Authorization": f"Bearer {relay_token}"},
                     )
             except httpx.HTTPError as e:
-                # 실패 사유를 Render Logs에도 남긴다(502 응답의 detail은 PC로만 가고 서버
-                # 로그에는 안 남아서 원인 추적이 어려웠다). 토큰 값은 절대 찍지 않는다.
-                print(f"[relay-fail] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
-                      f"url={relay_url!r} token_set={bool(relay_token)} "
-                      f"error={type(e).__name__}: {e}", flush=True)
-                raise HTTPException(status_code=502, detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {e}")
+                raise HTTPException(status_code=502, detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {_net_error_detail(e)}")
 
             print(f"[proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
                   f"host={host} via=relay status={resp.status_code}", flush=True)
@@ -1108,7 +1114,7 @@ async def proxy(request: Request, authorization: str = Header(default="")):
         async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC, verify=verify_option) as client:
             resp = await client.request(method, url, params=params, headers=headers, json=json_body)
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"대상 API 호출 실패: {e}")
+        raise HTTPException(status_code=502, detail=f"대상 API 호출 실패: {_net_error_detail(e)}")
 
     print(f"[proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
           f"host={host} status={resp.status_code}", flush=True)
