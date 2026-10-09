@@ -1084,6 +1084,17 @@ async def _diag_building(client) -> dict:
     return _diag_result(False, started, f"건축HUB 오류(resultCode={result_code}): {_snip(root.findtext('.//resultMsg') or text)}")
 
 
+async def _diag_outbound_ip(client) -> str | None:
+    """Render가 바깥으로 나갈 때 보이는 공인 IP. 중계 서버의 접속 로그/방화벽에서 "Render가 맞는지"
+    대조할 때 쓴다(IP는 서비스 재시작 등으로 바뀔 수 있다). 조회 실패는 조용히 None."""
+    try:
+        r = await client.get("https://api.ipify.org", timeout=5.0)
+        ip = (r.text or "").strip()
+        return ip if r.status_code == 200 and len(ip) <= 45 else None
+    except Exception:
+        return None
+
+
 async def _diag_vworld(client) -> dict:
     """VWorld 구간. NCP_RELAY_URL이 있으면 서비스와 똑같이 한국 중계 서버를 거치고, 없으면 Render가 직접 호출한다."""
     started = time.monotonic()
@@ -1092,6 +1103,10 @@ async def _diag_vworld(client) -> dict:
                    "stdrYear": str(datetime.now(KST).year - 1)}
     relay_url = os.environ.get("NCP_RELAY_URL", "").strip()
     steps = {}
+    if relay_url:
+        # Render가 "실제로 보고 있는" 중계 주소(오타/옛 IP/공백 여부 확인용). 계정정보나 경로는 뺀다.
+        _p = urllib.parse.urlsplit(relay_url)
+        steps["render가_보는_중계주소"] = f"{_p.scheme}://{_p.hostname}" + (f":{_p.port}" if _p.port else "") if _p.hostname else _mask_secrets(relay_url)
     try:
         if relay_url:
             base = relay_url.rstrip("/")
@@ -1139,8 +1154,8 @@ async def diagnose(authorization: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        kakao, building, vworld = await asyncio.gather(
-            _diag_kakao(client), _diag_building(client), _diag_vworld(client))
+        kakao, building, vworld, outbound_ip = await asyncio.gather(
+            _diag_kakao(client), _diag_building(client), _diag_vworld(client), _diag_outbound_ip(client))
     names = {"kakao": "카카오(주소검색)", "building_hub": "건축HUB(data.go.kr)", "vworld": "VWorld(NCP 중계 포함)"}
     checks = {"kakao": kakao, "building_hub": building, "vworld": vworld}
     failing = [names[k] for k, v in checks.items() if not v["ok"]]
@@ -1150,6 +1165,7 @@ async def diagnose(authorization: str = Header(default="")):
         "summary": "모든 구간 정상" if not failing else "문제 있음: " + ", ".join(failing),
         "checks": checks,
         "env_present": env_present,
+        "render_outbound_ip": outbound_ip,
         "agents_github": {
             "last_success_at": (datetime.fromtimestamp(_gh_cache["last_success_at"], KST).isoformat()
                                 if _gh_cache.get("last_success_at") else None),
