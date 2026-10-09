@@ -1056,6 +1056,11 @@ async def proxy(request: Request, authorization: str = Header(default="")):
                         headers={"Authorization": f"Bearer {relay_token}"},
                     )
             except httpx.HTTPError as e:
+                # 실패 사유를 Render Logs에도 남긴다(502 응답의 detail은 PC로만 가고 서버
+                # 로그에는 안 남아서 원인 추적이 어려웠다). 토큰 값은 절대 찍지 않는다.
+                print(f"[relay-fail] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
+                      f"url={relay_url!r} token_set={bool(relay_token)} "
+                      f"error={type(e).__name__}: {e}", flush=True)
                 raise HTTPException(status_code=502, detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {e}")
 
             print(f"[proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
