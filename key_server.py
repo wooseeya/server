@@ -96,6 +96,17 @@ GitHub Contents API로 직접 써서 남긴다 - 사람이 관리하는 agents.j
   - 저장소가 설정 안 됐거나 GitHub 저장이 실패하면 "등록하지 않고" 503으로 거부한다(실패해도
     무제한 등록되는 일이 없도록 안전한 쪽으로 닫는다). 이미 등록된 PC는 읽기 캐시로 계속 통과한다.
 
+★ v1.6 접속 IP 이상 징후 로그(로그만 남기고 차단은 하지 않는다)
+  - 같은 중개사 토큰이 하루(KST)에 서로 다른 접속 IP 3곳 이상에서 쓰이면 Render 로그에
+    [ip-warn] 줄을 남긴다. 2곳째부터는 [ip-new] 줄로 새 IP가 나타난 것을 기록한다.
+  - 기준(곳 수)은 환경변수 IP_WARN_THRESHOLD(기본 3, 0이면 경고 끔)로 바꾼다.
+  - 접속 IP는 X-Forwarded-For의 첫 값(실제 사용자 IP)만 센다 - 뒤쪽의 Cloudflare/Render 내부
+    주소는 요청마다 달라질 수 있어 세면 같은 사람이 여러 곳으로 잡힌다.
+  - 참고용 신호다: 노트북으로 사무실/집/핫스팟을 오가면 한 사람도 IP가 여러 개가 된다. 그래서
+    경고만 하고 절대 자동 차단하지 않는다. 서버 메모리에만 쌓으므로 재시작/슬립 시 초기화된다.
+  - 한계: X-Forwarded-For 앞쪽은 요청을 보내는 쪽이 조작할 수 있어서, 일부러 속이려는 사람은
+    이 신호를 피할 수 있다(기기 ID 확인과 함께 쓰는 보조 장치다).
+
 ★ v1.5 기기 차단 목록
     "동주부동산": {"token": "...", "max_devices": 2, "blocked_devices": ["134c-8d7f-03c9-df6d 퇴사자 PC"]}
   - blocked_devices에 적은 기기는 수동 등록/자동 등록/허용 대수와 상관없이 항상 거부된다
@@ -725,6 +736,41 @@ def _legacy_token_enabled() -> bool:
     return os.environ.get("DISABLE_LEGACY_TOKEN", "").strip().lower() not in ("1", "true", "yes", "on")
 
 
+_ip_seen_today: dict = {}   # {(중개사, "YYYY-MM-DD"): {접속IP: 처음 본 시각}} - 서버 메모리에만 있음
+
+
+def _ip_warn_threshold() -> int:
+    try:
+        return max(0, int(os.environ.get("IP_WARN_THRESHOLD", "3").strip() or "3"))
+    except ValueError:
+        return 3
+
+
+def _note_client_ip(name: str, request: Request | None) -> None:
+    """같은 토큰이 하루에 몇 곳의 IP에서 쓰였는지 세어, 기준(IP_WARN_THRESHOLD, 기본 3곳)에
+    닿으면 로그에 경고를 남긴다. 로그만 남기고 요청은 절대 막지 않는다."""
+    threshold = _ip_warn_threshold()
+    if threshold == 0:
+        return
+    ip = _client_ip(request).split(",")[0].strip()      # 맨 앞 = 실제 사용자 IP
+    if not ip or ip == "-":
+        return
+    now = datetime.now(KST)
+    today = now.strftime("%Y-%m-%d")
+    for k in [k for k in _ip_seen_today if k[1] != today]:   # 지난 날짜 기록 정리(메모리 증가 방지)
+        del _ip_seen_today[k]
+    bucket = _ip_seen_today.setdefault((name, today), {})
+    if ip in bucket:
+        return
+    bucket[ip] = now.isoformat(timespec="seconds")
+    count = len(bucket)
+    if count >= 2:
+        print(f"[ip-new] {now.isoformat(timespec='seconds')} agent={name} ip={ip} (오늘 {count}번째 IP)", flush=True)
+    if count >= threshold:
+        print(f"[ip-warn] {now.isoformat(timespec='seconds')} agent={name} 오늘 접속 IP {count}곳(기준 {threshold}곳) "
+              f"ips={', '.join(bucket)} - 토큰 공유가 의심되면 해당 중개사에게 확인하세요", flush=True)
+
+
 def _note_device_seen(name: str, request: Request | None) -> None:
     """(중개사, 기기) 조합을 서버가 켜진 뒤 처음 볼 때 한 번만 로그에 남긴다 - 제한이 없는
     항목에서도 "이 토큰을 몇 대가 쓰는지" 로그로 볼 수 있게 한다(매 요청 기록은 너무 시끄럽다)."""
@@ -765,6 +811,7 @@ def _authenticate(token_or_header: str, request: Request | None = None) -> str:
             raise HTTPException(status_code=401, detail="토큰이 만료되었습니다. 담당자에게 갱신을 요청하세요.")
         _check_device(name, entry, request)   # v1.2: 등록된 PC에서 온 요청인지 확인
         _note_device_seen(name, request)
+        _note_client_ip(name, request)
         return name
 
     # 레거시 폴백: 예전 방식(중개사 구분 없는 단일 토큰)으로 이미 배포된 exe가
