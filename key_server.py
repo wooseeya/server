@@ -1423,6 +1423,15 @@ async def proxy(request: Request, authorization: str = Header(default="")):
                     {"url": url, "method": method, "params": params, "headers": headers})
             except httpx.HTTPError as e:
                 # ConnectTimeout 등은 str(e)가 빈 문자열이라 예외 종류를 같이 남겨야 원인을 알 수 있다.
+                # 실패 사유가 응답 본문(detail)에만 담기면 Render 로그에는 "POST /proxy 502" 한 줄만
+                # 남는다. [relay-retry]는 "연결 단계" 실패만 남기므로, 읽기 시간 초과/SSL 오류/
+                # 연결 끊김 같은 나머지 실패도 로그에서 바로 보이도록 사유를 한 줄 남긴다
+                # (접속 대상은 호스트/포트만, 토큰·키는 _mask_secrets로 가린다).
+                _rp = urllib.parse.urlsplit(relay_url)
+                _target = f"{_rp.scheme}://{_rp.hostname}" + (f":{_rp.port}" if _rp.port else "") if _rp.hostname else "(NCP_RELAY_URL 형식 오류)"
+                print(f"[proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
+                      f"host={host} via=relay 호출 실패 -> {_target} : "
+                      f"{type(e).__name__}: {_mask_secrets(e)}", flush=True)
                 raise HTTPException(status_code=502,
                                     detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {type(e).__name__}: {_mask_secrets(e)}")
 
