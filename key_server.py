@@ -1492,6 +1492,63 @@ async def proxy(request: Request, authorization: str = Header(default="")):
 
 
 # ---------------------------------------------------------------------------
+# VWorld 직접 연결용 티켓 (v1.6)
+# ---------------------------------------------------------------------------
+# ⚠ [2026-10] Render(해외) -> 네이버클라우드 VM 구간이 ConnectTimeout으로 막혀(NCP
+# 서버에서 tcpdump로 Render의 연결 시도가 아예 도착하지 않음을 확인) VWorld 중계가
+# 동작하지 않는다. 반면 중개사 PC -> NCP 구간은 정상이다. 그래서 VWorld 요청만
+# Render를 거치지 않고 "PC -> NCP 릴레이"로 직접 보내게 한다.
+#
+# 이때 중개사 토큰 자체를 NCP로 보내지 않는다 - NCP 구간은 평문 HTTP라 토큰이
+# 그대로 노출되고, 그 토큰은 Claude/카카오/공공데이터 프록시까지 쓸 수 있기
+# 때문이다. 대신 Render가(HTTPS) 중개사 토큰/만료/기기 등록을 확인한 뒤 "VWorld
+# 중계 전용 티켓"을 발급한다:
+#     vw1.<만료UNIX초>.<중개사이름(base64url)>.<HMAC-SHA256 hex>
+# 서명 키는 NCP_RELAY_TOKEN(Render와 NCP 릴레이만 아는 공유 비밀값)이고, NCP
+# 릴레이는 Render에 되묻지 않고 서명과 만료만 로컬에서 검증한다. 티켓이 중간에
+# 노출돼도 (1) VWorld 중계 외에는 쓸 수 없고 (2) 짧은 시간 뒤 만료된다.
+# 토큰을 삭제/만료시키면 새 티켓을 못 받으므로 최대 이 시간 안에 VWorld 중계도 멈춘다.
+_VWORLD_TICKET_TTL_SEC = 600
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _make_vworld_ticket(agent_name: str, secret: str, now: float | None = None) -> tuple[str, int]:
+    """(티켓 문자열, 만료 UNIX초). vworld_relay.py의 _verify_ticket과 형식이 같아야 한다."""
+    exp = int((time.time() if now is None else now) + _VWORLD_TICKET_TTL_SEC)
+    msg = f"vw1.{exp}.{_b64url(agent_name.encode('utf-8'))}"
+    sig = hmac.new(secret.encode("utf-8"), msg.encode("ascii"), "sha256").hexdigest()
+    return f"{msg}.{sig}", exp
+
+
+@app.get("/vworld-ticket")
+async def vworld_ticket(request: Request, authorization: str = Header(default="")):
+    """앱(proxy_client.py)이 VWorld 요청을 NCP 릴레이로 직접 보낼 때 쓰는 단기 티켓을
+    발급한다. 중개사 토큰 인증(만료/기기 등록 포함)을 통과해야만 발급된다.
+
+    응답: {"ticket": str, "expires_at": int, "ttl": int, "relay_url": str}
+    (ttl은 지금부터의 유효시간(초) - 앱은 자기 PC 시계와 비교하지 않고 이 값만 센다)
+    NCP_RELAY_URL/NCP_RELAY_TOKEN이 없으면 503 - 앱은 이 경우 기존처럼 Render의
+    /proxy 경유로 되돌아간다."""
+    agent_name = _authenticate(authorization, request)
+    relay_url = os.environ.get("NCP_RELAY_URL", "").strip()
+    relay_token = os.environ.get("NCP_RELAY_TOKEN", "").strip()
+    if not relay_url or not relay_token:
+        raise HTTPException(status_code=503, detail="VWorld 직접 연결이 설정되어 있지 않습니다.")
+    if not relay_url.lower().startswith(("http://", "https://")):
+        # 예전에 NCP_RELAY_URL에 IP만 넣어 요청이 아예 나가지 못한 적이 있다.
+        raise HTTPException(
+            status_code=503,
+            detail="NCP_RELAY_URL은 http:// 또는 https://로 시작해야 합니다 (예: http://1.2.3.4:8080).")
+    ticket, exp = _make_vworld_ticket(agent_name, relay_token)
+    return {"ticket": ticket, "expires_at": exp, "ttl": _VWORLD_TICKET_TTL_SEC,
+            "relay_url": relay_url.rstrip("/")}
+
+
+
+# ---------------------------------------------------------------------------
 # Claude(Anthropic) API passthrough - main.py의 anthropic SDK가 base_url만
 # 이 서버로 바꾸면 코드 변경 없이 그대로 동작하도록, 실제 Anthropic API와
 # 똑같은 경로(/v1/messages)를 흉내낸다.
