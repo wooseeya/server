@@ -98,6 +98,14 @@ GitHub Contents API로 직접 써서 남긴다 - 사람이 관리하는 agents.j
   - 저장소가 설정 안 됐거나 GitHub 저장이 실패하면 "등록하지 않고" 503으로 거부한다(실패해도
     무제한 등록되는 일이 없도록 안전한 쪽으로 닫는다). 이미 등록된 PC는 읽기 캐시로 계속 통과한다.
 
+★ v1.7 중계 서버 연결 안정화
+  - Render -> 한국 중계 서버(NCP) 구간에서 "연결 단계(ConnectTimeout/ConnectError)"만 실패하면
+    새 연결로 최대 3번까지 다시 시도한다(연결 대기 5초). 연결이 안 된 요청은 중계 서버에 닿지
+    않았으므로 다시 보내도 안전하다. Render는 한 지역의 여러 공인 IP 중 아무거나로 나가므로,
+    특정 IP만 막히거나 경로가 불안정할 때는 재시도만으로도 대부분 성공한다. 로그: [relay-retry]
+  - 실패 문구에 예외 종류를 함께 남긴다(ConnectTimeout은 메시지가 빈 문자열이라 원인 구분이 안 됐다).
+  - /diagnose는 중계 서버 접속을 5번 시험해 "5회 중 N회 성공"을 알려준다(간헐 장애 확인용).
+
 ★ v1.6 접속 IP 이상 징후 로그(로그만 남기고 차단은 하지 않는다)
   - 같은 중개사 토큰이 하루(KST)에 서로 다른 접속 IP 3곳 이상에서 쓰이면 Render 로그에
     [ip-warn] 줄을 남긴다. 2곳째부터는 [ip-new] 줄로 새 IP가 나타난 것을 기록한다.
@@ -1253,12 +1261,31 @@ async def _diag_vworld(client) -> dict:
     try:
         if relay_url:
             base = relay_url.rstrip("/")
-            try:   # 1) 중계 서버가 살아 있는지(어떤 HTTP 응답이든 오면 "도달 가능")
-                pr = await client.get(base + "/")
-                steps["중계서버_도달"] = f"가능(HTTP {pr.status_code})"
-            except Exception as e:
-                return {**_diag_result(False, started, f"NCP 중계 서버에 연결할 수 없음: {type(e).__name__}: {_snip(e)}",
-                                       "NCP 서버가 꺼졌거나 NCP_RELAY_URL 주소/포트/방화벽(ACG) 문제"), "steps": steps}
+            # 1) 중계 서버에 닿는지 5번 동시에 시험한다(어떤 HTTP 응답이든 오면 "도달 가능"). Render는 한 지역의
+            #    여러 공인 IP 중 아무거나로 나가므로, 일부 IP만 막히면 "5회 중 일부만 성공"으로 나타난다.
+            async def _probe():
+                try:
+                    pr = await client.get(base + "/", timeout=4.0)
+                    return True, f"HTTP {pr.status_code}"
+                except Exception as e:
+                    return False, type(e).__name__
+            probes = await asyncio.gather(*[_probe() for _ in range(5)])
+            okn = sum(1 for ok, _ in probes if ok)
+            if okn == 5:
+                steps["중계서버_도달"] = "5회 중 5회 성공"
+            else:
+                fails = {}
+                for ok, what in probes:
+                    if not ok:
+                        fails[what] = fails.get(what, 0) + 1
+                steps["중계서버_도달"] = f"5회 중 {okn}회 성공 (실패: " + ", ".join(f"{k} {v}회" for k, v in fails.items()) + ")"
+                if okn == 0:
+                    return {**_diag_result(False, started, "NCP 중계 서버에 연결할 수 없음(5회 모두 실패)",
+                                           "NCP 서버 꺼짐/주소·포트 오류/방화벽 차단. 서버에서 fail2ban·ufw limit·iptables DROP 규칙도 확인"),
+                            "steps": steps}
+                return {**_diag_result(False, started, f"NCP 중계 서버 접속이 불안정함(5회 중 {okn}회 성공)",
+                                       "간헐 실패는 Render의 일부 출구 IP만 서버에서 걸러지는 경우가 많음 - 서버의 fail2ban/ufw limit/iptables와 Render 대시보드 Outbound 대역 확인"),
+                        "steps": steps}
             # 2) 서비스와 같은 방식(Render -> 중계 -> VWorld)으로 실제 호출
             r = await client.post(base + "/relay",
                                   json={"url": land_url, "method": "GET",
@@ -1314,8 +1341,33 @@ async def diagnose(authorization: str = Header(default="")):
                                 if _gh_cache.get("last_success_at") else None),
             "last_error": _mask_secrets(_gh_cache.get("last_error") or "") or None,
         },
-        "note": "시험 지번은 서울 강남구 역삼동 736-1이며, 결과가 0건이어도 연결·인증이 정상이면 '정상'으로 표시합니다.",
+        "note": "시험 지번은 서울 강남구 역삼동 736-1이며, 결과가 0건이어도 연결·인증이 정상이면 '정상'으로 표시합니다. "
+                "render_outbound_ip는 이번 한 번에 보인 값일 뿐이고, Render는 지역 대역 안의 여러 IP로 나갈 수 있습니다(대시보드 Connect > Outbound에서 대역 확인).",
     }
+
+
+_RELAY_CONNECT_TIMEOUT_SEC = 5.0   # 중계 서버와 "연결"을 맺는 데 기다릴 최대 시간(1회)
+_RELAY_CONNECT_ATTEMPTS = 3        # 연결 단계 실패 시 총 시도 횟수
+
+
+async def _post_to_relay(relay_url: str, relay_token: str, payload: dict):
+    """한국 중계 서버로 요청을 보낸다. 연결을 맺지 못한 경우(ConnectTimeout/ConnectError)에만 새 연결로
+    다시 시도한다 - 이 경우 요청이 중계 서버에 도달하지 않았으므로 중복 호출 걱정이 없다. 요청을 보낸
+    뒤의 지연(읽기 시간 초과 등)은 재시도하지 않는다(VWorld 호출이 두 번 나가는 것을 피하기 위해)."""
+    last_error = None
+    for attempt in range(1, _RELAY_CONNECT_ATTEMPTS + 1):
+        try:
+            timeout = httpx.Timeout(_PROXY_TIMEOUT_SEC, connect=_RELAY_CONNECT_TIMEOUT_SEC)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                return await client.post(
+                    f"{relay_url.rstrip('/')}/relay", json=payload,
+                    headers={"Authorization": f"Bearer {relay_token}"},
+                )
+        except (httpx.ConnectTimeout, httpx.ConnectError) as e:
+            last_error = e
+            print(f"[relay-retry] {datetime.now(timezone.utc).isoformat()} attempt={attempt}/{_RELAY_CONNECT_ATTEMPTS} "
+                  f"{type(e).__name__}", flush=True)
+    raise last_error
 
 
 @app.post("/proxy")
@@ -1366,14 +1418,13 @@ async def proxy(request: Request, authorization: str = Header(default="")):
         relay_token = os.environ.get("NCP_RELAY_TOKEN", "")
         if relay_url:
             try:
-                async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT_SEC) as client:
-                    resp = await client.post(
-                        f"{relay_url.rstrip('/')}/relay",
-                        json={"url": url, "method": method, "params": params, "headers": headers},
-                        headers={"Authorization": f"Bearer {relay_token}"},
-                    )
+                resp = await _post_to_relay(
+                    relay_url, relay_token,
+                    {"url": url, "method": method, "params": params, "headers": headers})
             except httpx.HTTPError as e:
-                raise HTTPException(status_code=502, detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {e}")
+                # ConnectTimeout 등은 str(e)가 빈 문자열이라 예외 종류를 같이 남겨야 원인을 알 수 있다.
+                raise HTTPException(status_code=502,
+                                    detail=f"한국 중계 서버(NCP_RELAY_URL) 호출 실패: {type(e).__name__}: {_mask_secrets(e)}")
 
             print(f"[proxy] {datetime.now(timezone.utc).isoformat()} agent={agent_name} "
                   f"host={host} via=relay status={resp.status_code}", flush=True)
