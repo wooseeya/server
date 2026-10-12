@@ -24,6 +24,8 @@ FastAPI 앱이다. 하는 일은 다섯 가지다:
                            launcher.py가 "언제까지였는지"를 사용자에게 보여줄
                            수 있다. /proxy, /v1/messages, /keys는 만료된 토큰을
                            그대로 거부한다(v0.11부터).
+  - GET  /activity       : 관리자 토큰(ADMIN_TOKEN)으로 중개사별 오늘의 접속 IP 수, 호출 횟수, 기기 차단 시도,
+                           마지막 접속을 한 번에 조회한다(서버 메모리 집계라 재시작하면 초기화).
   - GET  /diagnose       : 관리자 토큰(ADMIN_TOKEN)으로 Render -> 카카오 / 건축HUB(data.go.kr) / NCP 중계 ->
                            VWorld 연결을 한 번에 시험하고, 어디가 안 되는지 알려준다(키 값은 노출 안 함).
   - GET  /agents         : 관리자 토큰(ADMIN_TOKEN)으로만 등록된 중개사 이름/
@@ -649,6 +651,7 @@ def _check_device(name: str, entry: dict, request: Request | None) -> None:
     blocked = entry.get("blocked_devices") or []
     device = _request_device_id(request)
     if device and device in blocked:
+        _record_device_fail(name, device, "blocked")
         # 차단 목록이 최우선이다 - 수동 등록 목록/자동 등록 기록/허용 대수와 상관없이 무조건 거부.
         print(f"[device-fail] {datetime.now(timezone.utc).isoformat()} reason=blocked "
               f"agent={name} device={device} ip={_client_ip(request)}", flush=True)
@@ -688,6 +691,7 @@ def _check_device(name: str, entry: dict, request: Request | None) -> None:
         reason = "limit"
         message = ("이 토큰에 허용된 PC 수를 이미 모두 사용 중입니다. 다른 PC에서 쓰려면 "
                    "담당자에게 이 PC의 기기 ID를 전달해 변경을 요청하세요.")
+    _record_device_fail(name, device, reason)
     print(f"[device-fail] {datetime.now(timezone.utc).isoformat()} reason={reason} "
           f"agent={name} device={device or '-'} ip={_client_ip(request)}", flush=True)
     raise HTTPException(status_code=403, detail={"code": "device_not_registered", "message": message})
@@ -736,7 +740,10 @@ def _legacy_token_enabled() -> bool:
     return os.environ.get("DISABLE_LEGACY_TOKEN", "").strip().lower() not in ("1", "true", "yes", "on")
 
 
-_ip_seen_today: dict = {}   # {(중개사, "YYYY-MM-DD"): {접속IP: 처음 본 시각}} - 서버 메모리에만 있음
+_started_at = datetime.now(KST)   # 이 서버 프로세스가 시작된 시각 - 아래 집계들이 "여기서부터"의 기록이라는 표시용
+_ip_seen_today: dict = {}      # {(중개사, "YYYY-MM-DD"): {접속IP: 처음 본 시각}} - 서버 메모리에만 있음
+_last_seen: dict = {}          # {중개사: {"at": 시각, "ip": 접속IP}} - 마지막으로 인증에 성공한 요청
+_device_fail_today: dict = {}  # {(중개사, "YYYY-MM-DD"): {"count": n, "by_reason": {...}, "devices": {기기ID: n}}}
 
 
 def _ip_warn_threshold() -> int:
@@ -746,19 +753,23 @@ def _ip_warn_threshold() -> int:
         return 3
 
 
+def _drop_old_days(store: dict, today: str) -> None:
+    for k in [k for k in store if k[1] != today]:   # 지난 날짜 기록 정리(메모리 증가 방지)
+        del store[k]
+
+
 def _note_client_ip(name: str, request: Request | None) -> None:
-    """같은 토큰이 하루에 몇 곳의 IP에서 쓰였는지 세어, 기준(IP_WARN_THRESHOLD, 기본 3곳)에
-    닿으면 로그에 경고를 남긴다. 로그만 남기고 요청은 절대 막지 않는다."""
+    """(1) 마지막 접속과 (2) 같은 토큰이 하루에 몇 곳의 IP에서 쓰였는지 기록한다(/activity 조회용).
+    기준(IP_WARN_THRESHOLD, 기본 3곳)에 닿으면 로그에 경고도 남긴다 - 로그만 남기고 요청은 절대
+    막지 않는다. IP_WARN_THRESHOLD=0이면 경고 로그만 끄고 기록은 계속한다."""
     threshold = _ip_warn_threshold()
-    if threshold == 0:
-        return
     ip = _client_ip(request).split(",")[0].strip()      # 맨 앞 = 실제 사용자 IP
     if not ip or ip == "-":
         return
     now = datetime.now(KST)
     today = now.strftime("%Y-%m-%d")
-    for k in [k for k in _ip_seen_today if k[1] != today]:   # 지난 날짜 기록 정리(메모리 증가 방지)
-        del _ip_seen_today[k]
+    _last_seen[name] = {"at": now.isoformat(timespec="seconds"), "ip": ip}
+    _drop_old_days(_ip_seen_today, today)
     bucket = _ip_seen_today.setdefault((name, today), {})
     if ip in bucket:
         return
@@ -766,9 +777,20 @@ def _note_client_ip(name: str, request: Request | None) -> None:
     count = len(bucket)
     if count >= 2:
         print(f"[ip-new] {now.isoformat(timespec='seconds')} agent={name} ip={ip} (오늘 {count}번째 IP)", flush=True)
-    if count >= threshold:
+    if threshold and count >= threshold:
         print(f"[ip-warn] {now.isoformat(timespec='seconds')} agent={name} 오늘 접속 IP {count}곳(기준 {threshold}곳) "
               f"ips={', '.join(bucket)} - 토큰 공유가 의심되면 해당 중개사에게 확인하세요", flush=True)
+
+
+def _record_device_fail(name: str, device: str, reason: str) -> None:
+    """기기 제한에 걸려 거부된 요청을 오늘 집계에 더한다(/activity의 "차단 시도"). reason: blocked/limit/unregistered/missing"""
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    _drop_old_days(_device_fail_today, today)
+    rec = _device_fail_today.setdefault((name, today), {"count": 0, "by_reason": {}, "devices": {}})
+    rec["count"] += 1
+    rec["by_reason"][reason] = rec["by_reason"].get(reason, 0) + 1
+    key = device or "-"
+    rec["devices"][key] = rec["devices"].get(key, 0) + 1
 
 
 def _note_device_seen(name: str, request: Request | None) -> None:
@@ -1040,6 +1062,80 @@ def _validate_proxy_url(url) -> "httpx.URL":
     if (urllib.parse.urlparse(url).hostname or "") != host:
         raise HTTPException(status_code=403, detail="URL 해석이 일치하지 않아 거부합니다.")
     return u
+
+
+# ---------------------------------------------------------------------------
+# /activity - 관리자 전용 접속 현황 (토큰 공유 의심 징후를 한눈에)
+# ---------------------------------------------------------------------------
+@app.get("/activity")
+async def activity(authorization: str = Header(default="")):
+    """관리자 전용. 중개사별로 오늘의 접속 IP, 호출 횟수, 기기 차단 시도, 마지막 접속을 보여준다.
+    서버 메모리에 쌓은 집계라서 Render가 재시작/슬립하면 초기화된다(memory_since 이후의 기록)."""
+    admin_token = os.environ.get("ADMIN_TOKEN", "")
+    provided = authorization[7:] if authorization.startswith("Bearer ") else ""
+    if not admin_token or not _tokens_equal(provided, admin_token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    now = datetime.now(KST)
+    today = now.strftime("%Y-%m-%d")
+    threshold = _ip_warn_threshold()
+    entries = _load_agent_tokens()
+    names = set(entries) | set(_last_seen) | {k[0] for k in _ip_seen_today if k[1] == today} \
+        | {k[0] for k in _device_fail_today if k[1] == today}
+
+    def calls(name: str, bucket: str, env_name: str, default: int) -> dict:
+        limit = _env_int(env_name, default)
+        day, count = _usage.get((name, bucket), (today, 0))
+        return {"count": count if day == today else 0, "limit": limit if limit > 0 else None}
+
+    rows = []
+    for name in names:
+        entry = entries.get(name)
+        ips = _ip_seen_today.get((name, today), {})
+        fails = _device_fail_today.get((name, today))
+        row = {
+            "name": name,
+            "in_agents_json": entry is not None,
+            "ip_count_today": len(ips),
+            "ip_warn": bool(threshold) and len(ips) >= threshold,
+            "ips_today": [{"ip": ip, "first_seen": t} for ip, t in ips.items()],
+            "last_seen": _last_seen.get(name),
+            "calls_today": {
+                "proxy": calls(name, "proxy", "PROXY_DAILY_LIMIT", 5000),
+                "anthropic": calls(name, "anthropic", "ANTHROPIC_DAILY_LIMIT", 500),
+            },
+            "device_blocks_today": (
+                {"count": fails["count"], "by_reason": fails["by_reason"], "devices": list(fails["devices"])}
+                if fails else {"count": 0, "by_reason": {}, "devices": []}),
+        }
+        if entry is not None:
+            blocked = set(entry.get("blocked_devices") or [])
+            manual = [d for d in (entry.get("devices") or []) if d not in blocked]
+            auto = None
+            if _dev_cache.get("last_success_at"):
+                auto = len([x for x in _dev_cache["data"].get(name, []) if x["id"] not in blocked])
+            row["devices"] = {"max_devices": entry.get("max_devices"), "manual": len(manual),
+                              "auto_registered": auto, "blocked": len(blocked),
+                              "restricted": entry.get("devices") is not None or entry.get("max_devices") is not None}
+            row["expires"] = entry.get("expires")
+        rows.append(row)
+
+    rows.sort(key=lambda r: (not r["ip_warn"], -r["device_blocks_today"]["count"], -r["ip_count_today"], r["name"]))
+    attention = [r["name"] for r in rows if r["ip_warn"] or r["device_blocks_today"]["count"] > 0]
+    return {
+        "date": today,
+        "now": now.isoformat(timespec="seconds"),
+        "memory_since": _started_at.isoformat(timespec="seconds"),
+        "ip_warn_threshold": threshold or None,
+        "summary": ("이상 징후 없음" if not attention else "확인 필요: " + ", ".join(attention)),
+        "agents": rows,
+        "notes": [
+            "집계는 서버 메모리에만 있어 memory_since 이후의 기록입니다(재시작/슬립하면 초기화).",
+            "ip_warn은 오늘 접속 IP가 기준(ip_warn_threshold)곳 이상일 때 true입니다. 노트북으로 여러 곳에서 접속하는 정상 사용자도 걸릴 수 있어 참고용입니다.",
+            "device_blocks_today는 등록되지 않은 PC 등 기기 제한에 걸려 거부된 요청 수입니다(by_reason: blocked/limit/unregistered/missing).",
+            "한도가 limit=null(무제한)이면 호출 횟수는 집계하지 않습니다.",
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
